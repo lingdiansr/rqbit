@@ -17,6 +17,7 @@ use futures::stream::FuturesUnordered;
 use tracing::Instrument;
 use tracing::debug;
 use tracing::debug_span;
+use tracing::info;
 use tracing::trace;
 use tracing::trace_span;
 use url::Url;
@@ -310,7 +311,9 @@ impl TrackerComms {
             })?
             .0;
 
-        for peer in response.iter_peers() {
+        let peers: Vec<_> = response.iter_peers().collect();
+        info!(tracker=%tracker_url, peers=peers.len(), "tracker announce succeeded");
+        for peer in peers {
             self.tx.send(peer).await?;
         }
         Ok(Duration::from_secs(
@@ -421,7 +424,7 @@ impl TrackerComms {
 
         match client.announce(addr, request).await {
             Ok(response) => {
-                trace!(len = response.addrs.len(), "received announce response");
+                info!(tracker=?addr, peers=response.addrs.len(), "tracker announce succeeded");
                 for addr in response.addrs {
                     self.tx.send(addr).await.context("rx closed")?;
                 }
