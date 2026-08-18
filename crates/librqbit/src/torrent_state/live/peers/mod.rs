@@ -1,8 +1,4 @@
-use std::{
-    collections::HashSet,
-    net::{IpAddr, SocketAddr},
-    sync::Arc,
-};
+use std::{collections::HashSet, net::SocketAddr, sync::Arc};
 
 use dashmap::DashMap;
 use librqbit_core::lengths::ValidPieceIndex;
@@ -25,11 +21,6 @@ pub(crate) struct PeerStates {
 
     // This keeps track of live addresses we connected to, for PEX.
     pub live_outgoing_peers: RwLock<HashSet<PeerHandle>>,
-    // Tracks which IPs already have a tracked peer, to deduplicate the many
-    // NAT-behind peers that announce from different source ports (same IP).
-    // Mirrors libtorrent's `allow_multiple_connections_per_ip=false`: at most
-    // one peer per IP is kept in the connection pool.
-    pub active_ips: RwLock<HashSet<IpAddr>>,
     pub stats: AggregatePeerStatsAtomic,
     pub states: DashMap<PeerHandle, Peer>,
 }
@@ -49,16 +40,10 @@ impl PeerStates {
 
     pub fn add_if_not_seen(&self, addr: SocketAddr) -> Option<PeerHandle> {
         use dashmap::mapref::entry::Entry;
-        // Reject peers from an IP we already track (NAT multi-port peers
-        // announce from many source ports; one connection per host is enough).
-        if self.active_ips.read().contains(&addr.ip()) {
-            return None;
-        }
         match self.states.entry(addr) {
             Entry::Occupied(_) => None,
             Entry::Vacant(vac) => {
                 vac.insert(Peer::new_with_outgoing_address(addr));
-                self.active_ips.write().insert(addr.ip());
                 atomic_inc(&self.stats.queued);
                 atomic_inc(&self.session_stats.queued);
 
@@ -100,7 +85,6 @@ impl PeerStates {
 
     pub fn drop_peer(&self, handle: PeerHandle) -> Option<Peer> {
         let p = self.states.remove(&handle).map(|r| r.1)?;
-        self.active_ips.write().remove(&handle.ip());
         let s = p.get_state();
         self.stats.dec(s);
         self.session_stats.dec(s);

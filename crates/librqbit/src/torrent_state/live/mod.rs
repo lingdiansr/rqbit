@@ -265,7 +265,6 @@ impl TorrentStateLive {
                 stats: Default::default(),
                 states: Default::default(),
                 live_outgoing_peers: Default::default(),
-                active_ips: Default::default(),
             },
             _locked: RwLock::new(TorrentStateLocked {
                 pieces: Some(PieceTracker::new(paused.chunk_tracker)),
