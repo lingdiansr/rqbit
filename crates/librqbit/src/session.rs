@@ -945,6 +945,7 @@ impl Session {
         }
 
         if self.mse_mode == MseMode::Disabled {
+            debug!(?addr, "MSE disabled, skipping MSE incoming handshake");
             let mut read_buf = ReadBuf::new();
             let mut reader = reader;
             let h = read_buf
@@ -1008,6 +1009,7 @@ impl Session {
             }
             IncomingOutcome::Plaintext { read, write } => {
                 if self.mse_mode == MseMode::Forced {
+                    warn!(?addr, "MSE forced, rejecting plaintext connection");
                     bail!("MSE is forced, rejecting plaintext connection from {addr}");
                 }
                 // 9.0's `ReadBuf::read_handshake` performs a single `read()`
