@@ -10,6 +10,7 @@ use anyhow::{Context, Result, bail};
 use rand::{Rng, RngExt};
 use sha1w::{ISha1, Sha1};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
+use tracing::{debug, info, warn};
 
 use dh768::Dh768;
 use rc4::Rc4;
@@ -220,10 +221,14 @@ where
     let dh = Dh768::generate(&mut rand::rng());
     write.write_all(&dh.public_key_bytes()).await?;
     write.write_all(&random_pad(MAX_PAD)).await?;
+    debug!("sent MSE Ya + PadA, probing responder");
 
     // Sniff for a plaintext responder before committing to MSE.
     let (plaintext, sniffed) = sniff_plaintext(&mut read).await?;
     if plaintext.is_some() {
+        info!(
+            "peer answered with plaintext BT handshake within sniff window, falling back to plaintext redial"
+        );
         return Ok(OutgoingOutcome::PlaintextPeer);
     }
 
@@ -274,12 +279,18 @@ where
             }
         }
     }
-    let mut decrypt = candidate_decrypt
-        .ok_or_else(|| anyhow::anyhow!("MSE verification constant not found within PadB"))?;
+    let mut decrypt = match candidate_decrypt {
+        Some(d) => d,
+        None => {
+            warn!("MSE verification constant not found within PadB, aborting handshake");
+            bail!("MSE verification constant not found within PadB");
+        }
+    };
 
     let mut select = [0u8; 4];
     read_encrypted(&mut read, &mut decrypt, &mut select).await?;
     if u32::from_be_bytes(select) != CRYPTO_RC4 {
+        warn!("MSE responder did not select RC4, aborting handshake");
         bail!("MSE responder did not select RC4");
     }
     let mut pad_length = [0u8; 2];
@@ -291,6 +302,7 @@ where
     let mut pad_d = vec![0u8; pad_length];
     read_encrypted(&mut read, &mut decrypt, &mut pad_d).await?;
 
+    info!("MSE outgoing handshake complete, RC4 established");
     Ok(OutgoingOutcome::Encrypted(
         Rc4Reader::new(read, decrypt),
         Rc4Writer::new(write, encrypt),
@@ -319,11 +331,14 @@ where
         }
     }
     if prefix.len() == BT_PROTOCOL_PREFIX.len() {
+        info!("peer sent plaintext BT handshake, using plaintext path");
         return Ok(IncomingOutcome::Plaintext {
             read: PrefixReader::new(prefix, read),
             write,
         });
     }
+
+    debug!("peer did not send plaintext prefix, attempting MSE handshake");
 
     let mut client_public = [0u8; 96];
     client_public[..prefix.len()].copy_from_slice(&prefix);
@@ -350,6 +365,7 @@ where
     let mut vc = [0u8; VC_LEN];
     read_encrypted(&mut read, &mut decrypt, &mut vc).await?;
     if vc != [0u8; VC_LEN] {
+        warn!("MSE invalid verification constant, aborting handshake");
         bail!("MSE invalid verification constant");
     }
     let mut provide = [0u8; 4];
@@ -390,6 +406,7 @@ where
     read_encrypted(&mut read, &mut decrypt, &mut remaining).await?;
     handshake_bytes.extend_from_slice(&remaining);
 
+    info!("MSE incoming handshake complete, RC4 established");
     Ok(IncomingOutcome::Encrypted {
         read: Rc4Reader::new(read, decrypt),
         write: Rc4Writer::new(write, encrypt),
