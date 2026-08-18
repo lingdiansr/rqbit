@@ -96,6 +96,14 @@ pub(crate) struct PeerConnection<H> {
 }
 
 #[cfg(not(feature = "miri"))]
+// Handshake (BT handshake / MSE exchange) timeout, independent of the
+// read/write timeout used for regular messages. Mirrors libtorrent's
+// `handshake_timeout` (10s): a silent or unresponsive peer must be dropped
+// quickly so connection slots aren't held by zombie connections during
+// swarm startup.
+pub(crate) const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
+
+#[cfg(not(feature = "miri"))]
 pub(crate) async fn with_timeout<T>(
     name: &'static str,
     timeout_value: Duration,
@@ -157,7 +165,7 @@ async fn connect_with_mse_fallback(
     }
 
     let mse_outcome = match tokio::time::timeout(
-        rwtimeout,
+        HANDSHAKE_TIMEOUT,
         crate::mse::outgoing(read, write, info_hash, initial_payload),
     )
     .await
@@ -345,7 +353,9 @@ impl<H: PeerConnectionHandler> PeerConnection<H> {
             }
 
             let mut read_buf = ReadBuf::new();
-            let h = read_buf.read_handshake(&mut read, rwtimeout).await?;
+            let h = read_buf
+                .read_handshake(&mut read, HANDSHAKE_TIMEOUT)
+                .await?;
             let handshake_supports_extended = h.supports_extended();
             trace!(
                 peer_id=?h.peer_id,

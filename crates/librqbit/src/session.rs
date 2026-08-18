@@ -949,7 +949,7 @@ impl Session {
             let mut read_buf = ReadBuf::new();
             let mut reader = reader;
             let h = read_buf
-                .read_handshake(&mut reader, rwtimeout)
+                .read_handshake(&mut reader, crate::peer_connection::HANDSHAKE_TIMEOUT)
                 .await
                 .context("error reading handshake")?;
             return self
@@ -981,7 +981,7 @@ impl Session {
         };
 
         let incoming = crate::mse::incoming(reader, writer, lookup);
-        let incoming = tokio::time::timeout(rwtimeout, incoming)
+        let incoming = tokio::time::timeout(crate::peer_connection::HANDSHAKE_TIMEOUT, incoming)
             .await
             .context("MSE incoming handshake timed out")??;
 
@@ -1019,9 +1019,13 @@ impl Session {
                 // mirroring the Encrypted branch.
                 let mut handshake_bytes = [0u8; 68];
                 let mut read = read;
-                read.read_exact(&mut handshake_bytes)
-                    .await
-                    .context("error reading fragmented plaintext handshake")?;
+                tokio::time::timeout(
+                    crate::peer_connection::HANDSHAKE_TIMEOUT,
+                    read.read_exact(&mut handshake_bytes),
+                )
+                .await
+                .context("plaintext handshake read timed out")?
+                .context("error reading fragmented plaintext handshake")?;
                 let (h, _size) = Handshake::deserialize(&handshake_bytes[..]).map_err(|e| {
                     anyhow::anyhow!("error deserializing plaintext handshake: {e:?}")
                 })?;
