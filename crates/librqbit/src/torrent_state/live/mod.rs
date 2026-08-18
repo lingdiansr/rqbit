@@ -603,6 +603,12 @@ impl TorrentStateLive {
         self: Arc<Self>,
         mut peer_queue_rx: UnboundedReceiver<SocketAddr>,
     ) -> crate::Result<()> {
+        // Cap outgoing connection attempts per second (libtorrent
+        // `connection_speed` / `smooth_connects` analog, default 30/s). A poor
+        // peer pool would otherwise flood the network with connect attempts
+        // that mostly fail, drowning out effective connections.
+        const CONNECT_RATE_PER_SEC: u32 = 30;
+        let connect_interval = Duration::from_micros(1_000_000 / u64::from(CONNECT_RATE_PER_SEC));
         let state = self;
         loop {
             let addr = peer_queue_rx.recv().await.ok_or(Error::TorrentIsNotLive)?;
@@ -658,6 +664,7 @@ impl TorrentStateLive {
                 format!("[{}][addr={addr}]manage_peer", state.shared.id),
                 aframe!(state.clone().task_manage_outgoing_peer(addr, permit)),
             );
+            tokio::time::sleep(connect_interval).await;
         }
     }
 
