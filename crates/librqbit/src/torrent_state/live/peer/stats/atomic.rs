@@ -50,12 +50,17 @@ impl PeerCountersAtomic {
 }
 
 fn backoff() -> ExponentialBackoff {
+    // More aggressive than upstream defaults (was min 10s, factor 6,
+    // max 3600s, total 24h): mirrors libtorrent's quick peer turnover
+    // (max_failcount=3 / min_reconnect_time=60s). A dead peer retries after
+    // 5s and is dropped from the pool entirely after ~30 minutes of
+    // accumulated backoff, so connection slots aren't held by zombies.
     ExponentialBuilder::new()
-        .with_min_delay(Duration::from_secs(10))
-        .with_factor(6.)
+        .with_min_delay(Duration::from_secs(5))
+        .with_factor(4.)
         .with_jitter()
-        .with_max_delay(Duration::from_secs(3600))
-        .with_total_delay(Some(Duration::from_secs(86400)))
+        .with_max_delay(Duration::from_secs(600))
+        .with_total_delay(Some(Duration::from_secs(1800)))
         .without_max_times()
         .build()
 }
