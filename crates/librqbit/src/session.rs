@@ -1020,8 +1020,9 @@ impl Session {
                 read.read_exact(&mut handshake_bytes)
                     .await
                     .context("error reading fragmented plaintext handshake")?;
-                let (h, _size) = Handshake::deserialize(&handshake_bytes[..])
-                    .map_err(|e| anyhow::anyhow!("error deserializing plaintext handshake: {e:?}"))?;
+                let (h, _size) = Handshake::deserialize(&handshake_bytes[..]).map_err(|e| {
+                    anyhow::anyhow!("error deserializing plaintext handshake: {e:?}")
+                })?;
                 self.finish_incoming_connection(
                     addr,
                     kind,

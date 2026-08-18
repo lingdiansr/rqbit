@@ -26,7 +26,7 @@ use peer_binary_protocol::{
 use serde::{Deserialize, Serialize};
 use serde_with::serde_as;
 use tokio::time::timeout;
-use tracing::{Instrument, debug, trace, trace_span};
+use tracing::{Instrument, debug, info, trace, trace_span, warn};
 
 use crate::{
     read_buf::ReadBuf,
@@ -149,6 +149,10 @@ async fn connect_with_mse_fallback(
         with_timeout("connecting", connect_timeout, connector.connect(addr)).await?;
 
     if mse_mode == MseMode::Disabled || !matches!(ckind, ConnectionKind::Tcp) {
+        debug!(
+            ?addr,
+            "MSE skipped (disabled or non-TCP), connecting plaintext"
+        );
         return Ok((ckind, read, write, false));
     }
 
@@ -159,11 +163,25 @@ async fn connect_with_mse_fallback(
     .await
     {
         Ok(Ok(outcome)) => outcome,
-        Ok(Err(_)) | Err(_) => {
+        Ok(Err(e)) => {
             if mse_mode == MseMode::Forced {
+                warn!(
+                    ?addr,
+                    "MSE forced but handshake failed, dropping peer: {e:#}"
+                );
                 return Err(Error::MseForced(addr));
             }
-            // MSE handshake failed or timed out; redial plaintext.
+            warn!(?addr, "MSE handshake failed, redialing plaintext: {e:#}");
+            let (nk, nr, nw) =
+                with_timeout("connecting", connect_timeout, connector.connect(addr)).await?;
+            return Ok((nk, nr, nw, false));
+        }
+        Err(_elapsed) => {
+            if mse_mode == MseMode::Forced {
+                warn!(?addr, "MSE forced but handshake timed out, dropping peer");
+                return Err(Error::MseForced(addr));
+            }
+            warn!(?addr, "MSE handshake timed out, redialing plaintext");
             let (nk, nr, nw) =
                 with_timeout("connecting", connect_timeout, connector.connect(addr)).await?;
             return Ok((nk, nr, nw, false));
@@ -172,15 +190,20 @@ async fn connect_with_mse_fallback(
 
     match mse_outcome {
         OutgoingOutcome::Encrypted(r, w) => {
+            info!(?addr, "MSE handshake succeeded, RC4 established");
             Ok((ckind, Box::new(r.into_vectored_compat()), Box::new(w), true))
         }
         OutgoingOutcome::PlaintextPeer => {
             // The peer answered with a plaintext BT handshake within the sniff
             // window. In Forced mode we cannot downgrade.
             if mse_mode == MseMode::Forced {
+                warn!(
+                    ?addr,
+                    "MSE forced but peer answered plaintext, dropping peer"
+                );
                 return Err(Error::MseForced(addr));
             }
-            // MSE polluted this stream with Ya + PadA; redial plaintext.
+            info!(?addr, "peer answered plaintext, redialing plaintext");
             let (nk, nr, nw) =
                 with_timeout("connecting", connect_timeout, connector.connect(addr)).await?;
             Ok((nk, nr, nw, false))
