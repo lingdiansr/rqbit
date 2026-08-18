@@ -38,4 +38,14 @@ impl DhtBuilder {
     }
 }
 
-pub static DHT_BOOTSTRAP: &[&str] = &["dht.transmissionbt.com:6881", "dht.libtorrent.org:25401"];
+// Bootstrap nodes: upstream only had transmissionbt + libtorrent.org (the
+// latter frequently unreachable from some networks, e.g. CN). Add the
+// mainstream BitTorrent/uTorrent/BitComet routers so DHT bootstraps reliably
+// from multiple nodes; critical for pure-DHT magnets (no tracker in URL).
+pub static DHT_BOOTSTRAP: &[&str] = &[
+    "router.bittorrent.com:6881",
+    "router.utorrent.com:6881",
+    "router.bitcomet.net:6881",
+    "dht.transmissionbt.com:6881",
+    "dht.libtorrent.org:25401",
+];
