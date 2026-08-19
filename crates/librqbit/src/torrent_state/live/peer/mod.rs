@@ -52,11 +52,14 @@ impl Peer {
         }
     }
 
-    pub fn new_with_outgoing_address(addr: SocketAddr) -> Self {
+    pub fn new_with_outgoing_address(
+        addr: SocketAddr,
+        backoff_config: Option<crate::PeerBackoffConfig>,
+    ) -> Self {
         Self {
             addr,
             outgoing_address: Some(addr),
-            stats: Default::default(),
+            stats: stats::atomic::PeerStats::with_backoff_config(backoff_config),
             state: Default::default(),
         }
     }

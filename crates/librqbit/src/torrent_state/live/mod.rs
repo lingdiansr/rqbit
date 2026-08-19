@@ -265,6 +265,7 @@ impl TorrentStateLive {
                 stats: Default::default(),
                 states: Default::default(),
                 live_outgoing_peers: Default::default(),
+                peer_backoff: paused.shared.options.peer_backoff.clone(),
             },
             _locked: RwLock::new(TorrentStateLocked {
                 pieces: Some(PieceTracker::new(paused.chunk_tracker)),
@@ -604,6 +605,13 @@ impl TorrentStateLive {
         mut peer_queue_rx: UnboundedReceiver<SocketAddr>,
     ) -> crate::Result<()> {
         let state = self;
+        // Optional cap on outgoing connection attempts per second
+        // (configurable via `connect_rate`); None = unlimited (upstream).
+        let connect_interval = state
+            .shared
+            .options
+            .connect_rate
+            .map(|n| Duration::from_micros(1_000_000 / u64::from(n.max(1))));
         loop {
             let addr = peer_queue_rx.recv().await.ok_or(Error::TorrentIsNotLive)?;
             if state.shared.options.disable_upload() && state.is_finished_and_no_active_streams() {
@@ -658,6 +666,9 @@ impl TorrentStateLive {
                 format!("[{}][addr={addr}]manage_peer", state.shared.id),
                 aframe!(state.clone().task_manage_outgoing_peer(addr, permit)),
             );
+            if let Some(i) = connect_interval {
+                tokio::time::sleep(i).await;
+            }
         }
     }
 
