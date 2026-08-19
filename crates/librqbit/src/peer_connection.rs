@@ -80,9 +80,8 @@ pub struct PeerConnectionOptions {
     #[serde_as(as = "Option<serde_with::DurationSeconds>")]
     pub keep_alive_interval: Option<Duration>,
 
-    /// How MSE (Message Stream Encryption) is applied to this peer
-    /// connection. Defaults to [`MseMode::Disabled`] while the feature is
-    /// rolled out.
+    /// How MSE (Message Stream Encryption) is applied to this peer connection.
+    /// Defaults to [`MseMode::Enabled`].
     pub mse_mode: crate::mse::MseMode,
 }
 

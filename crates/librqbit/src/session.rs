@@ -486,7 +486,7 @@ pub struct SessionOptions {
     pub client_name_and_version: Option<String>,
 
     /// How MSE (Message Stream Encryption) is applied to peer connections.
-    /// Disabled by default while the feature is rolled out.
+    /// Defaults to [`MseMode::Enabled`].
     pub mse_mode: MseMode,
 }
 
