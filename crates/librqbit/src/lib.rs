@@ -58,6 +58,7 @@ pub mod http_api_client;
 #[cfg(any(feature = "http-api", feature = "http-api-client"))]
 pub mod http_api_types;
 mod ip_ranges;
+mod mse;
 pub mod limits;
 mod listen;
 mod merge_streams;
@@ -83,6 +84,7 @@ mod vectored_traits;
 pub mod watch;
 
 pub use error::{Error, Result};
+pub use mse::MseMode;
 
 pub use api::Api;
 pub use api_error::{ApiError, WithStatus, WithStatusError};
