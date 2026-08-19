@@ -9,3 +9,4 @@
 //! - PR 5: outgoing wiring + plaintext fallback, then enabled by default
 
 pub mod rc4;
+pub mod dh768;
