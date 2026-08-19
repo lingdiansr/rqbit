@@ -112,6 +112,7 @@ pub(crate) struct ManagedTorrentOptions {
     pub force_tracker_interval: Option<Duration>,
     pub peer_connect_timeout: Option<Duration>,
     pub peer_read_write_timeout: Option<Duration>,
+    #[cfg(feature = "mse")]
     pub mse_mode: crate::mse::MseMode,
     /// Outgoing connection attempts per second cap; None = unlimited.
     pub connect_rate: Option<u32>,

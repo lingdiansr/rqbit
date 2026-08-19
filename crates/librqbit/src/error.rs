@@ -1,5 +1,6 @@
 use governor::InsufficientCapacity;
 use peer_binary_protocol::MessageDeserializeError;
+#[cfg(feature = "mse")]
 use std::net::SocketAddr;
 use tokio::sync::AcquireError;
 
@@ -119,6 +120,7 @@ pub enum Error {
     #[error("session is dead")]
     SessionDestroyed,
 
+    #[cfg(feature = "mse")]
     #[error("MSE is forced, but peer {0} did not complete the MSE handshake")]
     MseForced(SocketAddr),
 

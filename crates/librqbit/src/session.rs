@@ -11,6 +11,10 @@ use std::{
     time::Duration,
 };
 
+#[cfg(feature = "mse")]
+use crate::mse::{IncomingOutcome, MseMode};
+#[cfg(feature = "mse")]
+use crate::vectored_traits::AsyncReadVectoredIntoCompat;
 use crate::{
     ApiError, CreateTorrentOptions, FileInfos, ManagedTorrent, ManagedTorrentShared,
     api::TorrentIdOrHash,
@@ -23,7 +27,6 @@ use crate::{
     limits::{Limits, LimitsConfig},
     listen::{Accept, ListenerOptions},
     merge_streams::merge_streams,
-    mse::{IncomingOutcome, MseMode},
     peer_connection::PeerConnectionOptions,
     read_buf::ReadBuf,
     session_persistence::{SessionPersistenceStore, json::JsonSessionPersistenceStore},
@@ -40,7 +43,6 @@ use crate::{
         TorrentMetadata, TorrentStateLive, initializing::TorrentStateInitializing,
     },
     type_aliases::{BoxAsyncReadVectored, BoxAsyncWrite, PeerStream},
-    vectored_traits::AsyncReadVectoredIntoCompat,
 };
 use anyhow::{Context, bail};
 use arc_swap::ArcSwapOption;
@@ -69,7 +71,9 @@ use librqbit_utp::BindDevice;
 use parking_lot::RwLock;
 use peer_binary_protocol::Handshake;
 use serde::{Deserialize, Serialize};
+#[cfg(feature = "mse")]
 use sha1w::{ISha1, Sha1};
+#[cfg(feature = "mse")]
 use tokio::io::AsyncReadExt;
 use tokio::sync::Notify;
 use tokio_util::sync::{CancellationToken, DropGuard};
@@ -155,6 +159,7 @@ pub struct Session {
     pub ipv4_only: bool,
     pub peer_limit: Option<usize>,
     client_name_and_version: String,
+    #[cfg(feature = "mse")]
     mse_mode: MseMode,
     peer_backoff: Option<crate::PeerBackoffConfig>,
 }
@@ -488,6 +493,7 @@ pub struct SessionOptions {
 
     /// How MSE (Message Stream Encryption) is applied to peer connections.
     /// Defaults to [`MseMode::Enabled`].
+    #[cfg(feature = "mse")]
     pub mse_mode: MseMode,
 
     /// Backoff config for dead outgoing peers. `None` uses the upstream
@@ -521,6 +527,7 @@ impl Default for SessionOptions {
             disable_local_service_discovery: false,
             ipv4_only: false,
             client_name_and_version: None,
+            #[cfg(feature = "mse")]
             mse_mode: MseMode::default(),
             peer_backoff: None,
         }
@@ -648,6 +655,7 @@ impl Session {
             } else {
                 None
             };
+            #[cfg_attr(not(feature = "mse"), allow(unused_mut))]
             let mut peer_opts = opts
                 .connect
                 .as_ref()
@@ -656,7 +664,10 @@ impl Session {
             // The session-level MSE mode is authoritative for outgoing
             // connections (including magnet metadata reads), regardless of any
             // per-connection PeerConnectionOptions.
-            peer_opts.mse_mode = opts.mse_mode;
+            #[cfg(feature = "mse")]
+            {
+                peer_opts.mse_mode = opts.mse_mode;
+            }
 
             async fn persistence_factory(
                 opts: &SessionOptions,
@@ -826,6 +837,7 @@ impl Session {
                 disable_trackers: opts.disable_trackers,
                 peer_limit: opts.peer_limit,
                 client_name_and_version,
+                #[cfg(feature = "mse")]
                 mse_mode: opts.mse_mode,
                 peer_backoff: opts.peer_backoff,
 
@@ -954,99 +966,102 @@ impl Session {
             bail!("Incoming ip {incoming_ip} is not in allowlist");
         }
 
-        if self.mse_mode == MseMode::Disabled {
-            debug!(?addr, "MSE disabled, skipping MSE incoming handshake");
-            let mut read_buf = ReadBuf::new();
-            let mut reader = reader;
-            let h = read_buf
-                .read_handshake(&mut reader, handshake_timeout)
+        #[cfg(feature = "mse")]
+        if self.mse_mode != MseMode::Disabled {
+            // Snapshot the (SKEY hash -> info_hash) mapping for every known torrent
+            // so the MSE acceptor can resolve the peer's obfuscated info hash.
+            let torrent_keys: Vec<([u8; 20], [u8; 20])> = self
+                .db
+                .read()
+                .torrents
+                .values()
+                .map(|torrent| {
+                    let info_hash = torrent.info_hash().0;
+                    let mut h = Sha1::new();
+                    h.update(b"req2");
+                    h.update(&info_hash);
+                    (h.finish(), info_hash)
+                })
+                .collect();
+
+            let lookup = |skey_hash: &[u8; 20]| -> Option<[u8; 20]> {
+                torrent_keys
+                    .iter()
+                    .find(|(k, _)| k == skey_hash)
+                    .map(|(_, info_hash)| *info_hash)
+            };
+
+            let incoming = crate::mse::incoming(reader, writer, lookup);
+            let incoming = tokio::time::timeout(handshake_timeout, incoming)
                 .await
-                .context("error reading handshake")?;
-            return self
-                .finish_incoming_connection(addr, kind, h, reader, writer, read_buf)
-                .await;
-        }
+                .context("MSE incoming handshake timed out")??;
 
-        // Snapshot the (SKEY hash -> info_hash) mapping for every known torrent
-        // so the MSE acceptor can resolve the peer's obfuscated info hash.
-        let torrent_keys: Vec<([u8; 20], [u8; 20])> = self
-            .db
-            .read()
-            .torrents
-            .values()
-            .map(|torrent| {
-                let info_hash = torrent.info_hash().0;
-                let mut h = Sha1::new();
-                h.update(b"req2");
-                h.update(&info_hash);
-                (h.finish(), info_hash)
-            })
-            .collect();
-
-        let lookup = |skey_hash: &[u8; 20]| -> Option<[u8; 20]> {
-            torrent_keys
-                .iter()
-                .find(|(k, _)| k == skey_hash)
-                .map(|(_, info_hash)| *info_hash)
-        };
-
-        let incoming = crate::mse::incoming(reader, writer, lookup);
-        let incoming = tokio::time::timeout(handshake_timeout, incoming)
-            .await
-            .context("MSE incoming handshake timed out")??;
-
-        match incoming {
-            IncomingOutcome::Encrypted {
-                read,
-                write,
-                handshake_bytes,
-                info_hash,
-            } => {
-                let (h, _size) = Handshake::deserialize(&handshake_bytes[..])
-                    .map_err(|e| anyhow::anyhow!("error deserializing MSE handshake: {e:?}"))?;
-                if h.info_hash.0 != info_hash {
-                    bail!("MSE handshake info hash does not match SKEY");
-                }
-                self.finish_incoming_connection(
-                    addr,
-                    kind,
-                    h,
-                    Box::new(read.into_vectored_compat()),
-                    Box::new(write),
-                    ReadBuf::new(),
-                )
-                .await
-            }
-            IncomingOutcome::Plaintext { read, write } => {
-                if self.mse_mode == MseMode::Forced {
-                    warn!(?addr, "MSE forced, rejecting plaintext connection");
-                    bail!("MSE is forced, rejecting plaintext connection from {addr}");
-                }
-                // 9.0's `ReadBuf::read_handshake` performs a single `read()`
-                // before deserializing; a `PrefixReader` replaying the 20
-                // consumed prefix bytes would satisfy it with only those bytes.
-                // Read the full 68-byte handshake ourselves (read_exact loops),
-                // mirroring the Encrypted branch.
-                let mut handshake_bytes = [0u8; 68];
-                let mut read = read;
-                tokio::time::timeout(handshake_timeout, read.read_exact(&mut handshake_bytes))
+            return match incoming {
+                IncomingOutcome::Encrypted {
+                    read,
+                    write,
+                    handshake_bytes,
+                    info_hash,
+                } => {
+                    let (h, _size) = Handshake::deserialize(&handshake_bytes[..])
+                        .map_err(|e| anyhow::anyhow!("error deserializing MSE handshake: {e:?}"))?;
+                    if h.info_hash.0 != info_hash {
+                        bail!("MSE handshake info hash does not match SKEY");
+                    }
+                    self.finish_incoming_connection(
+                        addr,
+                        kind,
+                        h,
+                        Box::new(read.into_vectored_compat()),
+                        Box::new(write),
+                        ReadBuf::new(),
+                    )
                     .await
-                    .context("plaintext handshake read timed out")?
-                    .context("error reading fragmented plaintext handshake")?;
-                let (h, _size) = Handshake::deserialize(&handshake_bytes[..]).map_err(|e| {
-                    anyhow::anyhow!("error deserializing plaintext handshake: {e:?}")
-                })?;
-                self.finish_incoming_connection(
-                    addr,
-                    kind,
-                    h,
-                    Box::new(read.into_vectored_compat()),
-                    Box::new(write),
-                    ReadBuf::new(),
-                )
-                .await
-            }
+                }
+                IncomingOutcome::Plaintext { read, write } => {
+                    if self.mse_mode == MseMode::Forced {
+                        warn!(?addr, "MSE forced, rejecting plaintext connection");
+                        bail!("MSE is forced, rejecting plaintext connection from {addr}");
+                    }
+                    // 9.0's `ReadBuf::read_handshake` performs a single `read()`
+                    // before deserializing; a `PrefixReader` replaying the 20
+                    // consumed prefix bytes would satisfy it with only those bytes.
+                    // Read the full 68-byte handshake ourselves (read_exact loops),
+                    // mirroring the Encrypted branch.
+                    let mut handshake_bytes = [0u8; 68];
+                    let mut read = read;
+                    tokio::time::timeout(handshake_timeout, read.read_exact(&mut handshake_bytes))
+                        .await
+                        .context("plaintext handshake read timed out")?
+                        .context("error reading fragmented plaintext handshake")?;
+                    let (h, _size) = Handshake::deserialize(&handshake_bytes[..]).map_err(|e| {
+                        anyhow::anyhow!("error deserializing plaintext handshake: {e:?}")
+                    })?;
+                    self.finish_incoming_connection(
+                        addr,
+                        kind,
+                        h,
+                        Box::new(read.into_vectored_compat()),
+                        Box::new(write),
+                        ReadBuf::new(),
+                    )
+                    .await
+                }
+            };
         }
+
+        // Plaintext handshake: MSE is disabled, or the crate was built without
+        // the `mse` feature.
+        debug!(?addr, "accepting plaintext incoming connection");
+        let mut read_buf = ReadBuf::new();
+        let mut reader = reader;
+        let h = read_buf
+            .read_handshake(&mut reader, handshake_timeout)
+            .await
+            .context("error reading handshake")?;
+        return self
+            .finish_incoming_connection(addr, kind, h, reader, writer, read_buf)
+            .await;
     }
 
     async fn finish_incoming_connection(
@@ -1161,6 +1176,7 @@ impl Session {
             keep_alive_interval: other
                 .keep_alive_interval
                 .or(self.peer_opts.keep_alive_interval),
+            #[cfg(feature = "mse")]
             mse_mode: self.mse_mode,
             handshake_timeout: other.handshake_timeout.or(self.peer_opts.handshake_timeout),
             connect_rate: other.connect_rate.or(self.peer_opts.connect_rate),
@@ -1382,8 +1398,12 @@ impl Session {
                     let peer_rx = make_peer_rx().context(
                         "no known way to resolve peers (no DHT, no trackers, no initial_peers)",
                     )?;
+                    #[cfg_attr(not(feature = "mse"), allow(unused_mut))]
                     let mut magnet_peer_opts = opts.peer_opts.unwrap_or_default();
-                    magnet_peer_opts.mse_mode = self.mse_mode;
+                    #[cfg(feature = "mse")]
+                    {
+                        magnet_peer_opts.mse_mode = self.mse_mode;
+                    }
                     let resolved_magnet = self
                         .resolve_magnet(info_hash, peer_rx, &trackers, Some(magnet_peer_opts))
                         .await?;
@@ -1479,6 +1499,7 @@ impl Session {
                     force_tracker_interval: opts.force_tracker_interval,
                     peer_connect_timeout: peer_opts.connect_timeout,
                     peer_read_write_timeout: peer_opts.read_write_timeout,
+                    #[cfg(feature = "mse")]
                     mse_mode: self.mse_mode,
                     connect_rate: peer_opts.connect_rate,
                     peer_backoff: self.peer_backoff,

@@ -61,6 +61,7 @@ mod ip_ranges;
 pub mod limits;
 mod listen;
 mod merge_streams;
+#[cfg(feature = "mse")]
 mod mse;
 mod peer_connection;
 mod peer_info_reader;
@@ -84,6 +85,7 @@ mod vectored_traits;
 pub mod watch;
 
 pub use error::{Error, Result};
+#[cfg(feature = "mse")]
 pub use mse::MseMode;
 
 pub use api::Api;
