@@ -58,6 +58,10 @@ pub mod http_api_client;
 #[cfg(any(feature = "http-api", feature = "http-api-client"))]
 pub mod http_api_types;
 mod ip_ranges;
+// Dormant until MSE is wired into peer connections (PR 6/7); the attribute is
+// removed once all items are reachable.
+#[allow(dead_code)]
+mod mse;
 pub mod limits;
 mod listen;
 mod merge_streams;
