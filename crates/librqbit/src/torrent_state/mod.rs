@@ -113,6 +113,10 @@ pub(crate) struct ManagedTorrentOptions {
     pub peer_connect_timeout: Option<Duration>,
     pub peer_read_write_timeout: Option<Duration>,
     pub mse_mode: crate::mse::MseMode,
+    /// Outgoing connection attempts per second cap; None = unlimited.
+    pub connect_rate: Option<u32>,
+    /// Backoff config for dead outgoing peers; None = upstream defaults.
+    pub peer_backoff: Option<crate::PeerBackoffConfig>,
     pub allow_overwrite: bool,
     pub output_folder: PathBuf,
     pub ratelimits: LimitsConfig,

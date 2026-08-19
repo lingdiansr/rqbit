@@ -83,6 +83,17 @@ pub struct PeerConnectionOptions {
     /// How MSE (Message Stream Encryption) is applied to this peer connection.
     /// Defaults to [`MseMode::Enabled`].
     pub mse_mode: crate::mse::MseMode,
+
+    /// Handshake timeout (BT handshake + MSE exchange), independent of
+    /// `read_write_timeout` used for regular messages. `None` falls back to
+    /// `read_write_timeout`. Defaults to the upstream behavior (no separate
+    /// handshake timeout).
+    #[serde_as(as = "Option<serde_with::DurationSeconds>")]
+    pub handshake_timeout: Option<Duration>,
+
+    /// Cap on outgoing connection attempts per second. `None` disables the
+    /// rate limit (upstream behavior).
+    pub connect_rate: Option<u32>,
 }
 
 pub(crate) struct PeerConnection<H> {
@@ -138,7 +149,7 @@ async fn connect_with_mse_fallback(
     addr: SocketAddr,
     info_hash: &[u8; 20],
     connect_timeout: Duration,
-    rwtimeout: Duration,
+    handshake_timeout: Duration,
     initial_payload: &[u8; 68],
     mse_mode: MseMode,
 ) -> Result<(ConnectionKind, BoxAsyncReadVectored, BoxAsyncWrite, bool)> {
@@ -157,7 +168,7 @@ async fn connect_with_mse_fallback(
     }
 
     let mse_outcome = match tokio::time::timeout(
-        rwtimeout,
+        handshake_timeout,
         crate::mse::outgoing(read, write, info_hash, initial_payload),
     )
     .await
@@ -209,6 +220,20 @@ async fn connect_with_mse_fallback(
             Ok((nk, nr, nw, false))
         }
     }
+}
+
+/// Configurable exponential backoff for dead peers. `None` at the session
+/// level uses the upstream defaults (min 10s, factor 6, max 3600s, total 24h).
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct PeerBackoffConfig {
+    /// Initial retry delay after a peer dies.
+    pub min_delay: Duration,
+    /// Exponential growth factor between retries.
+    pub factor: f32,
+    /// Upper bound on a single retry delay.
+    pub max_delay: Duration,
+    /// Total accumulated backoff before the peer is dropped from the pool.
+    pub total_delay: Option<Duration>,
 }
 
 impl<H: PeerConnectionHandler> PeerConnection<H> {
@@ -307,6 +332,10 @@ impl<H: PeerConnectionHandler> PeerConnection<H> {
             .connect_timeout
             .unwrap_or_else(|| Duration::from_secs(10));
 
+        // Separate handshake timeout (BT handshake + MSE exchange); falls back
+        // to read_write_timeout when unset (upstream behavior).
+        let handshake_timeout = self.options.handshake_timeout.unwrap_or(rwtimeout);
+
         let now = Instant::now();
         // Serialize our BT handshake once; it doubles as the MSE initial
         // payload (IA) and as the plaintext handshake.
@@ -318,7 +347,7 @@ impl<H: PeerConnectionHandler> PeerConnection<H> {
             self.addr,
             &self.info_hash.0,
             connect_timeout,
-            rwtimeout,
+            handshake_timeout,
             &write_buf[..hsz].try_into().map_err(|_| {
                 Error::Anyhow(anyhow::anyhow!(
                     "serialized BT handshake has invalid length"
@@ -345,7 +374,9 @@ impl<H: PeerConnectionHandler> PeerConnection<H> {
             }
 
             let mut read_buf = ReadBuf::new();
-            let h = read_buf.read_handshake(&mut read, rwtimeout).await?;
+            let h = read_buf
+                .read_handshake(&mut read, handshake_timeout)
+                .await?;
             let handshake_supports_extended = h.supports_extended();
             trace!(
                 peer_id=?h.peer_id,
