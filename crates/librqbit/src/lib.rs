@@ -58,10 +58,10 @@ pub mod http_api_client;
 #[cfg(any(feature = "http-api", feature = "http-api-client"))]
 pub mod http_api_types;
 mod ip_ranges;
-mod mse;
 pub mod limits;
 mod listen;
 mod merge_streams;
+mod mse;
 mod peer_connection;
 mod peer_info_reader;
 mod piece_tracker;

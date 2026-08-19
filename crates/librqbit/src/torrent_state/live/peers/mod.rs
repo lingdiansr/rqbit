@@ -45,10 +45,7 @@ impl PeerStates {
         match self.states.entry(addr) {
             Entry::Occupied(_) => None,
             Entry::Vacant(vac) => {
-                vac.insert(Peer::new_with_outgoing_address(
-                    addr,
-                    self.peer_backoff.clone(),
-                ));
+                vac.insert(Peer::new_with_outgoing_address(addr, self.peer_backoff));
                 atomic_inc(&self.stats.queued);
                 atomic_inc(&self.session_stats.queued);
 

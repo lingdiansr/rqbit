@@ -1481,7 +1481,7 @@ impl Session {
                     peer_read_write_timeout: peer_opts.read_write_timeout,
                     mse_mode: self.mse_mode,
                     connect_rate: peer_opts.connect_rate,
-                    peer_backoff: self.peer_backoff.clone(),
+                    peer_backoff: self.peer_backoff,
                     allow_overwrite: opts.overwrite,
                     output_folder,
                     ratelimits: opts.ratelimits,
