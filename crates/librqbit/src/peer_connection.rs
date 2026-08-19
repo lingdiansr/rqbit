@@ -26,7 +26,7 @@ use peer_binary_protocol::{
 use serde::{Deserialize, Serialize};
 use serde_with::serde_as;
 use tokio::time::timeout;
-use tracing::{Instrument, debug, trace, trace_span};
+use tracing::{Instrument, debug, trace, trace_span, warn};
 
 use crate::{
     read_buf::ReadBuf,
@@ -127,6 +127,91 @@ struct ManagePeerArgs {
     have_broadcast: tokio::sync::broadcast::Receiver<ValidPieceIndex>,
 }
 
+/// Attempt an MSE handshake on a fresh connection; on failure or plaintext
+/// detection, redial plaintext on a new stream (never reuse the MSE-polluted
+/// one). Returns the final streams and whether MSE was applied.
+///
+/// `initial_payload` is the complete 68-byte BT handshake, consumed as the MSE
+/// IA when MSE succeeds; when `mse_applied` is false the caller must still
+/// write it out as a plaintext handshake.
+async fn connect_with_mse_fallback(
+    connector: &StreamConnector,
+    addr: SocketAddr,
+    info_hash: &[u8; 20],
+    connect_timeout: Duration,
+    rwtimeout: Duration,
+    initial_payload: &[u8; 68],
+    mse_mode: MseMode,
+) -> Result<(ConnectionKind, BoxAsyncReadVectored, BoxAsyncWrite, bool)> {
+    use crate::mse::OutgoingOutcome;
+    use crate::vectored_traits::AsyncReadVectoredIntoCompat;
+
+    let (ckind, read, write) =
+        with_timeout("connecting", connect_timeout, connector.connect(addr)).await?;
+
+    if mse_mode == MseMode::Disabled || !matches!(ckind, ConnectionKind::Tcp) {
+        debug!(
+            ?addr,
+            "MSE skipped (disabled or non-TCP), connecting plaintext"
+        );
+        return Ok((ckind, read, write, false));
+    }
+
+    let mse_outcome = match tokio::time::timeout(
+        rwtimeout,
+        crate::mse::outgoing(read, write, info_hash, initial_payload),
+    )
+    .await
+    {
+        Ok(Ok(outcome)) => outcome,
+        Ok(Err(e)) => {
+            if mse_mode == MseMode::Forced {
+                warn!(
+                    ?addr,
+                    "MSE forced but handshake failed, dropping peer: {e:#}"
+                );
+                return Err(Error::MseForced(addr));
+            }
+            debug!(?addr, "MSE handshake failed, redialing plaintext: {e:#}");
+            let (nk, nr, nw) =
+                with_timeout("connecting", connect_timeout, connector.connect(addr)).await?;
+            return Ok((nk, nr, nw, false));
+        }
+        Err(_elapsed) => {
+            if mse_mode == MseMode::Forced {
+                warn!(?addr, "MSE forced but handshake timed out, dropping peer");
+                return Err(Error::MseForced(addr));
+            }
+            debug!(?addr, "MSE handshake timed out, redialing plaintext");
+            let (nk, nr, nw) =
+                with_timeout("connecting", connect_timeout, connector.connect(addr)).await?;
+            return Ok((nk, nr, nw, false));
+        }
+    };
+
+    match mse_outcome {
+        OutgoingOutcome::Encrypted(r, w) => {
+            debug!(?addr, "MSE handshake succeeded, RC4 established");
+            Ok((ckind, Box::new(r.into_vectored_compat()), Box::new(w), true))
+        }
+        OutgoingOutcome::PlaintextPeer => {
+            // The peer answered with a plaintext BT handshake within the sniff
+            // window. In Forced mode we cannot downgrade.
+            if mse_mode == MseMode::Forced {
+                warn!(
+                    ?addr,
+                    "MSE forced but peer answered plaintext, dropping peer"
+                );
+                return Err(Error::MseForced(addr));
+            }
+            debug!(?addr, "peer answered plaintext, redialing plaintext");
+            let (nk, nr, nw) =
+                with_timeout("connecting", connect_timeout, connector.connect(addr)).await?;
+            Ok((nk, nr, nw, false))
+        }
+    }
+}
+
 impl<H: PeerConnectionHandler> PeerConnection<H> {
     pub fn new(
         addr: SocketAddr,
@@ -224,27 +309,41 @@ impl<H: PeerConnectionHandler> PeerConnection<H> {
             .unwrap_or_else(|| Duration::from_secs(10));
 
         let now = Instant::now();
-        let (ckind, mut read, mut write) = with_timeout(
-            "connecting",
+        // Serialize our BT handshake once; it doubles as the MSE initial
+        // payload (IA) and as the plaintext handshake.
+        let mut write_buf = Box::new([0u8; MAX_MSG_LEN]);
+        let handshake = Handshake::new(self.info_hash, self.peer_id);
+        let hsz = handshake.serialize_unchecked_len(&mut *write_buf);
+        let (ckind, mut read, mut write, mse_applied) = connect_with_mse_fallback(
+            &self.connector,
+            self.addr,
+            &self.info_hash.0,
             connect_timeout,
-            self.connector.connect(self.addr),
+            rwtimeout,
+            &write_buf[..hsz].try_into().map_err(|_| {
+                Error::Anyhow(anyhow::anyhow!(
+                    "serialized BT handshake has invalid length"
+                ))
+            })?,
+            self.options.mse_mode,
         )
         .await?;
 
         async move {
             self.handler.on_connected(now.elapsed());
 
-            let mut write_buf = Box::new([0u8; MAX_MSG_LEN]);
-            let handshake = Handshake::new(self.info_hash, self.peer_id);
-            let hsz = handshake.serialize_unchecked_len(&mut *write_buf);
-            with_timeout(
-                "writing",
-                rwtimeout,
-                write
-                    .write_all(&write_buf[..hsz])
-                    .map_err(Error::WriteHandshake),
-            )
-            .await?;
+            // When MSE succeeded it already consumed the handshake as IA.
+            // Otherwise (plaintext, MSE disabled, or non-TCP) write it now.
+            if !mse_applied {
+                with_timeout(
+                    "writing",
+                    rwtimeout,
+                    write
+                        .write_all(&write_buf[..hsz])
+                        .map_err(Error::WriteHandshake),
+                )
+                .await?;
+            }
 
             let mut read_buf = ReadBuf::new();
             let h = read_buf.read_handshake(&mut read, rwtimeout).await?;
