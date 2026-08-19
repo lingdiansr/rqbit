@@ -10,3 +10,4 @@
 
 pub mod rc4;
 pub mod dh768;
+pub mod stream;
