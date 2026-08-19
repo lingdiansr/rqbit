@@ -4,7 +4,9 @@ use std::{
     time::{Duration, Instant},
 };
 
-use crate::{Error, Result, session::CheckedIncomingConnection, stream_connect::ConnectionKind};
+use crate::{
+    Error, Result, mse::MseMode, session::CheckedIncomingConnection, stream_connect::ConnectionKind,
+};
 use buffers::{ByteBuf, ByteBufOwned};
 use futures::TryFutureExt;
 use librqbit_core::{
@@ -77,6 +79,11 @@ pub struct PeerConnectionOptions {
 
     #[serde_as(as = "Option<serde_with::DurationSeconds>")]
     pub keep_alive_interval: Option<Duration>,
+
+    /// How MSE (Message Stream Encryption) is applied to this peer
+    /// connection. Defaults to [`MseMode::Disabled`] while the feature is
+    /// rolled out.
+    pub mse_mode: crate::mse::MseMode,
 }
 
 pub(crate) struct PeerConnection<H> {

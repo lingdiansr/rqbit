@@ -87,6 +87,7 @@ mod vectored_traits;
 pub mod watch;
 
 pub use error::{Error, Result};
+pub use mse::MseMode;
 
 pub use api::Api;
 pub use api_error::{ApiError, WithStatus, WithStatusError};

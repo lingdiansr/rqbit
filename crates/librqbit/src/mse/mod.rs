@@ -29,6 +29,21 @@ const BT_HANDSHAKE_LEN: usize = 68;
 const MAX_PAD: usize = 512;
 const VC_LEN: usize = 8;
 const CRYPTO_RC4: u32 = 2;
+
+/// How MSE is applied to peer connections.
+///
+/// `Disabled` skips MSE entirely (plaintext only) and is the default while
+/// the feature is being rolled out; `Enabled` prefers MSE and falls back to a
+/// plaintext redial on failure; `Forced` requires MSE and drops any peer that
+/// does not complete the MSE handshake.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub enum MseMode {
+    #[default]
+    Disabled,
+    Enabled,
+    Forced,
+}
+
 const PLAINTEXT_SNIFF_TIMEOUT: Duration = Duration::from_secs(2);
 pub enum OutgoingOutcome<R, W> {
     /// MSE handshake completed; use the RC4-wrapped streams.
