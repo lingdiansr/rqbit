@@ -277,6 +277,15 @@ pub(crate) struct LivePeerState {
     pub tx: PeerTx,
 
     pub connection_kind: ConnectionKind,
+
+    // Tit-for-tat choke state (whether *we* are choking this peer).
+    pub am_choking: bool,
+
+    // Upload bytes at the last rechoke round (to compute per-round deltas).
+    pub last_rechoke_uploaded: u64,
+    // Download bytes from this peer at the last rechoke round (for
+    // reciprocation-based unchoke ordering while leeching).
+    pub last_rechoke_fetched: u64,
 }
 
 impl LivePeerState {
@@ -296,6 +305,9 @@ impl LivePeerState {
             request_slots_changed: Default::default(),
             tx,
             connection_kind,
+            am_choking: true,
+            last_rechoke_uploaded: 0,
+            last_rechoke_fetched: 0,
         }
     }
 

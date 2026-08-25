@@ -125,6 +125,12 @@ pub(crate) struct ManagedTorrentOptions {
     /// Max bad pieces a peer may send before being disconnected. Defaults to
     /// 5 when None (aligned with transmission `MaxBadPiecesPerPeer`).
     pub max_bad_pieces_per_peer: Option<u32>,
+    /// Number of unchoke slots for tit-for-tat. Defaults to 8 when None
+    /// (aligned with libtorrent `unchoke_slots_limit`).
+    pub unchoke_slots: Option<u32>,
+    /// Period of the tit-for-tat rechoke task in seconds. Defaults to 10 when
+    /// None (aligned with transmission `RechokePeriod`).
+    pub rechoke_interval_secs: Option<u64>,
     pub allow_overwrite: bool,
     pub output_folder: PathBuf,
     pub ratelimits: LimitsConfig,

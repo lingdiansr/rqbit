@@ -57,6 +57,12 @@ pub trait PeerConnectionHandler {
     fn client_name_and_version(&self) -> &str {
         crate::client_name_and_version()
     }
+    /// Whether the peer should be unchoked on connection establishment.
+    /// Defaults to false (choked); the choker (tit-for-tat) decides when to
+    /// unchoke via its periodic rechoke task.
+    fn should_unchoke(&self) -> bool {
+        false
+    }
 }
 
 #[derive(Debug)]
@@ -468,14 +474,24 @@ impl<H: PeerConnectionHandler> PeerConnection<H> {
                 trace!("sent bitfield");
             }
 
-            let len = Message::Unchoke.serialize(&mut *write_buf, &Default::default)?;
+            // Unchoke only if the choker says so (tit-for-tat); otherwise stay
+            // choked until the periodic rechoke task decides to unchoke.
+            let msg = if self.handler.should_unchoke() {
+                Message::Unchoke
+            } else {
+                Message::Choke
+            };
+            let len = msg.serialize(&mut *write_buf, &Default::default)?;
             with_timeout(
                 "writing",
                 rwtimeout,
                 write.write_all(&write_buf[..len]).map_err(Error::Write),
             )
             .await?;
-            trace!("sent unchoke");
+            trace!(
+                unchoked = self.handler.should_unchoke(),
+                "sent initial choke state"
+            );
 
             let mut broadcast_closed = false;
 
