@@ -1293,7 +1293,9 @@ const DEFAULT_RECHOKE_INTERVAL_SECS: u64 = 10;
 
 /// Per-chunk request timeout before the request is cancelled and re-scheduled
 /// (aligned with transmission `RequestTimeoutSecs`).
-const DEFAULT_CHUNK_REQUEST_TIMEOUT_SECS: u64 = 25;
+// Isolation test: effectively disable block-request timeout so timed-out
+// chunks are never re-queued to other peers.
+const DEFAULT_CHUNK_REQUEST_TIMEOUT_SECS: u64 = 86400;
 
 /// How long a peer is snubbed after a chunk request timeout.
 const DEFAULT_SNUB_DURATION_SECS: u64 = 60;
