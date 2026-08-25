@@ -1510,6 +1510,8 @@ impl Session {
                     first_wave_peers: opts.first_wave_peers,
                     max_bad_pieces_per_peer: opts.max_bad_pieces_per_peer,
                     peer_backoff: self.peer_backoff.clone(),
+                    unchoke_slots: None,
+                    rechoke_interval_secs: None,
                     allow_overwrite: opts.overwrite,
                     output_folder,
                     ratelimits: opts.ratelimits,

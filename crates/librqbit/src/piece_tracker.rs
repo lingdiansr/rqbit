@@ -46,11 +46,12 @@ pub enum AcquireResult {
 }
 
 /// Parameters for acquiring a piece.
-pub struct AcquireRequest<'a, I, P, S>
+pub struct AcquireRequest<'a, I, P, S, R>
 where
     I: Iterator<Item = ValidPieceIndex>,
     P: Fn(ValidPieceIndex) -> bool,
     S: Fn(ValidPieceIndex) -> bool,
+    R: Fn(ValidPieceIndex) -> u32,
 {
     /// The peer requesting a piece.
     pub peer: PeerHandle,
@@ -66,6 +67,9 @@ where
     pub peer_has_piece: P,
     /// Returns true if the piece can be stolen (e.g., not locked for writing).
     pub can_steal: S,
+    /// Returns how many peers hold the given piece (replication count), used
+    /// to order queued pieces rarest-first.
+    pub piece_rarity: R,
 }
 
 /// Coordinates piece download state.
@@ -120,11 +124,15 @@ impl PieceTracker {
     ///
     /// If `Stolen` is returned, the caller MUST call `peers.on_steal()` to notify
     /// the old peer and update counters.
-    pub fn acquire_piece<I, P, S>(&mut self, mut req: AcquireRequest<I, P, S>) -> AcquireResult
+    pub fn acquire_piece<I, P, S, R>(
+        &mut self,
+        mut req: AcquireRequest<I, P, S, R>,
+    ) -> AcquireResult
     where
         I: Iterator<Item = ValidPieceIndex>,
         P: Fn(ValidPieceIndex) -> bool,
         S: Fn(ValidPieceIndex) -> bool,
+        R: Fn(ValidPieceIndex) -> u32,
     {
         // 1. Try steal with 10x threshold (very slow peer)
         if let Some(result) = self.try_steal(&req, 10.0) {
@@ -142,12 +150,14 @@ impl PieceTracker {
             }
         }
 
-        // Then check naturally ordered queued pieces
-        // Note: iter_queued_pieces only returns pieces in queue_pieces (not in-flight)
-        let queued: Vec<_> = self
+        // Then check queued pieces, ordered rarest-first: stable sort by the
+        // per-peer replication count ascending (ties keep the file-priority
+        // order from iter_queued_pieces). The peer must hold the piece.
+        let mut queued: Vec<_> = self
             .chunks
             .iter_queued_pieces(req.file_priorities, req.file_infos)
             .collect();
+        queued.sort_by_key(|p| (req.piece_rarity)(*p));
 
         for piece in queued {
             if (req.peer_has_piece)(piece) {
@@ -177,15 +187,16 @@ impl PieceTracker {
     }
 
     /// Try to steal a piece from a slower peer.
-    fn try_steal<I, P, S>(
+    fn try_steal<I, P, S, R>(
         &mut self,
-        req: &AcquireRequest<I, P, S>,
+        req: &AcquireRequest<I, P, S, R>,
         threshold: f64,
     ) -> Option<AcquireResult>
     where
         I: Iterator<Item = ValidPieceIndex>,
         P: Fn(ValidPieceIndex) -> bool,
         S: Fn(ValidPieceIndex) -> bool,
+        R: Fn(ValidPieceIndex) -> u32,
     {
         let my_avg = req.peer_avg_time?;
         let min_elapsed = Duration::from_secs_f64(my_avg.as_secs_f64() * threshold);
@@ -396,6 +407,7 @@ mod tests {
             file_infos: &file_infos,
             peer_has_piece: |_| true, // Peer has all pieces
             can_steal: |_| true,
+            piece_rarity: |_| 0,
         });
 
         // Should reserve piece 0 (first in queue)
@@ -429,6 +441,7 @@ mod tests {
             file_infos: &file_infos,
             peer_has_piece: |p| p.get() >= 2,
             can_steal: |_| true,
+            piece_rarity: |_| 0,
         });
 
         match result {
@@ -457,6 +470,7 @@ mod tests {
             file_infos: &file_infos,
             peer_has_piece: |_| true,
             can_steal: |_| true,
+            piece_rarity: |_| 0,
         });
 
         let piece = match result {
@@ -490,6 +504,7 @@ mod tests {
             file_infos: &file_infos,
             peer_has_piece: |_| true,
             can_steal: |_| true,
+            piece_rarity: |_| 0,
         });
 
         let piece = match result {
@@ -518,6 +533,7 @@ mod tests {
             file_infos: &file_infos,
             peer_has_piece: |p| p == piece, // Only has the failed piece
             can_steal: |_| true,
+            piece_rarity: |_| 0,
         });
 
         match result2 {
@@ -547,6 +563,7 @@ mod tests {
             file_infos: &file_infos,
             peer_has_piece: |_| true,
             can_steal: |_| true,
+            piece_rarity: |_| 0,
         }) {
             AcquireResult::Reserved(p) => p,
             _ => panic!("Expected Reserved"),
@@ -559,6 +576,7 @@ mod tests {
             file_infos: &file_infos,
             peer_has_piece: |_| true,
             can_steal: |_| true,
+            piece_rarity: |_| 0,
         }) {
             AcquireResult::Reserved(p) => p,
             _ => panic!("Expected Reserved"),
@@ -573,6 +591,7 @@ mod tests {
             file_infos: &file_infos,
             peer_has_piece: |_| true,
             can_steal: |_| true,
+            piece_rarity: |_| 0,
         }) {
             AcquireResult::Reserved(p) => p,
             _ => panic!("Expected Reserved"),
@@ -612,6 +631,7 @@ mod tests {
             file_infos: &file_infos,
             peer_has_piece: |_| true,
             can_steal: |_| true,
+            piece_rarity: |_| 0,
         });
         tracker.acquire_piece(AcquireRequest {
             peer: peer(1),
@@ -621,6 +641,7 @@ mod tests {
             file_infos: &file_infos,
             peer_has_piece: |_| true,
             can_steal: |_| true,
+            piece_rarity: |_| 0,
         });
 
         assert_eq!(tracker.inflight_count(), 2);
@@ -638,6 +659,7 @@ mod tests {
             file_infos: &file_infos,
             peer_has_piece: |_| true,
             can_steal: |_| true,
+            piece_rarity: |_| 0,
         });
 
         // Should get piece 0 again (was requeued)
@@ -676,6 +698,7 @@ mod tests {
             file_infos: &file_infos,
             peer_has_piece: |_| true,
             can_steal: |_| true,
+            piece_rarity: |_| 0,
         });
 
         // Should get piece 3 (first priority piece)
@@ -702,6 +725,7 @@ mod tests {
             file_infos: &file_infos,
             peer_has_piece: |_| false, // Peer has nothing
             can_steal: |_| true,
+            piece_rarity: |_| 0,
         });
 
         match result {
@@ -750,6 +774,7 @@ mod tests {
             file_infos: &file_infos,
             peer_has_piece: |_| true,
             can_steal: |_| true,
+            piece_rarity: |_| 0,
         }) {
             AcquireResult::Reserved(p) => {
                 assert_eq!(p.get(), 0);
@@ -766,6 +791,7 @@ mod tests {
             file_infos: &file_infos,
             peer_has_piece: |_| true,
             can_steal: |_| true,
+            piece_rarity: |_| 0,
         }) {
             AcquireResult::Reserved(p) => {
                 assert_eq!(p.get(), 4);
@@ -788,6 +814,7 @@ mod tests {
             file_infos: &file_infos,
             peer_has_piece: |p| p.get() == 4, // Peer B only has piece 4
             can_steal: |_| true,
+            piece_rarity: |_| 0,
         });
 
         // Should steal piece 4 (which peer B has), NOT piece 0 (which peer B doesn't have)

@@ -1,8 +1,9 @@
+use std::time::{Duration, Instant};
 use std::{collections::HashSet, net::SocketAddr, sync::Arc};
 
 use dashmap::DashMap;
 use librqbit_core::lengths::ValidPieceIndex;
-use parking_lot::RwLock;
+use parking_lot::{Mutex, RwLock};
 
 use crate::{
     Error,
@@ -10,11 +11,14 @@ use crate::{
     type_aliases::{BF, PeerHandle},
 };
 
-use self::stats::{AggregatePeerStats, AggregatePeerStatsAtomic};
-
 use super::peer::{LivePeerState, Peer, PeerRx, PeerState, PeerTx};
 
 pub mod stats;
+
+use self::stats::{AggregatePeerStats, AggregatePeerStatsAtomic};
+
+/// How long the piece rarity cache stays valid before recomputation.
+const RARITY_CACHE_TTL: Duration = Duration::from_secs(1);
 
 pub(crate) struct PeerStates {
     pub session_stats: Arc<AggregatePeerStatsAtomic>,
@@ -25,6 +29,9 @@ pub(crate) struct PeerStates {
     pub peer_backoff: Option<crate::PeerBackoffConfig>,
     pub stats: AggregatePeerStatsAtomic,
     pub states: DashMap<PeerHandle, Peer>,
+    // Piece rarity cache: `(computed_at, total_pieces, counts)`. Reused across
+    // acquire calls to avoid recomputing per-request.
+    pub(crate) rarity_cache: Mutex<Option<(Instant, usize, Vec<u32>)>>,
 }
 
 impl Drop for PeerStates {
@@ -120,6 +127,33 @@ impl PeerStates {
         self.with_live_mut(handle, "update_bitfield", |live| {
             live.bitfield = bitfield;
         })
+    }
+
+    /// Per-piece replication count (how many live peers hold each piece),
+    /// cached for a short window since `acquire` runs per chunk. Used to
+    /// order piece selection rarest-first (transmission `count_piece_replication`).
+    pub fn piece_rarity_counts(&self, total_pieces: usize) -> Vec<u32> {
+        let now = Instant::now();
+        let mut cache = self.rarity_cache.lock();
+        match &*cache {
+            Some((t, tp, counts)) if *tp == total_pieces && t.elapsed() < RARITY_CACHE_TTL => {
+                return counts.clone();
+            }
+            _ => {}
+        }
+        let mut counts = vec![0u32; total_pieces];
+        for entry in self.states.iter() {
+            let Some(live) = entry.value().get_live() else {
+                continue;
+            };
+            for idx in live.bitfield.as_ref().iter_ones() {
+                if let Some(c) = counts.get_mut(idx) {
+                    *c += 1;
+                }
+            }
+        }
+        *cache = Some((now, total_pieces, counts.clone()));
+        counts
     }
 
     pub fn mark_peer_connecting(&self, h: PeerHandle) -> crate::Result<(PeerRx, PeerTx)> {

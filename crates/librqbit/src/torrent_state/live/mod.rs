@@ -266,6 +266,7 @@ impl TorrentStateLive {
                 states: Default::default(),
                 live_outgoing_peers: Default::default(),
                 peer_backoff: paused.shared.options.peer_backoff.clone(),
+                rarity_cache: Default::default(),
             },
             _locked: RwLock::new(TorrentStateLocked {
                 pieces: Some(PieceTracker::new(paused.chunk_tracker)),
@@ -338,6 +339,12 @@ impl TorrentStateLive {
             debug_span!(parent: state.shared.span.clone(), "upload_scheduler"),
             format!("[{}]upload_scheduler", state.shared.id),
             state.clone().task_upload_scheduler(ratelimit_upload_rx),
+        );
+
+        state.spawn(
+            debug_span!(parent: state.shared.span.clone(), "rechoke"),
+            format!("[{}]rechoke", state.shared.id),
+            state.clone().task_rechoke(),
         );
         Ok(state)
     }
@@ -697,6 +704,106 @@ impl TorrentStateLive {
         }
     }
 
+    /// Periodic tit-for-tat rechoke: re-rank live peers by reciprocation
+    /// (while leeching) or upload rate (while seeding) and update the
+    /// unchoke slots. Period defaults to 10s.
+    async fn task_rechoke(self: Arc<Self>) -> crate::Result<()> {
+        let state = self;
+        let interval_secs = state
+            .shared
+            .options
+            .rechoke_interval_secs
+            .unwrap_or(DEFAULT_RECHOKE_INTERVAL_SECS);
+        let mut ticker = tokio::time::interval(Duration::from_secs(interval_secs));
+        loop {
+            ticker.tick().await;
+            state.rechoke_round();
+        }
+    }
+
+    fn rechoke_round(&self) {
+        use rand::seq::IteratorRandom;
+        let is_seed = self.is_finished_and_no_active_streams();
+        let slots = self
+            .shared
+            .options
+            .unchoke_slots
+            .unwrap_or(DEFAULT_UNCHOKE_SLOTS) as usize;
+
+        // Collect per-peer upload/download deltas and interest since the last
+        // round. While seeding we prioritize interested peers (so a pure
+        // leecher isn't starved), then upload rate; while leeching we prefer
+        // reciprocation (download rate from the peer).
+        let mut scored: Vec<(PeerHandle, u64, u64, bool)> = self
+            .peers
+            .states
+            .iter()
+            .filter_map(|e| {
+                let live = e.value().get_live()?;
+                let c = e.value().stats.counters.clone();
+                Some((
+                    *e.key(),
+                    c.uploaded_bytes
+                        .load(Ordering::Relaxed)
+                        .saturating_sub(live.last_rechoke_uploaded),
+                    c.fetched_bytes
+                        .load(Ordering::Relaxed)
+                        .saturating_sub(live.last_rechoke_fetched),
+                    live.peer_interested,
+                ))
+            })
+            .collect();
+
+        if is_seed {
+            // Interested first (seed has upload bandwidth to spare and a pure
+            // leecher has no upload to rank on), then by upload rate.
+            use std::cmp::Reverse;
+            scored.sort_by_key(|a| (Reverse(a.3), Reverse(a.1)));
+        } else {
+            // Reciprocation: prefer peers we download most from.
+            use std::cmp::Reverse;
+            scored.sort_by_key(|a| Reverse(a.2));
+        }
+
+        // Choose the unchoke slots: top N + one random optimistic peer.
+        let mut in_slot: HashSet<PeerHandle> =
+            scored.iter().take(slots).map(|(a, _, _, _)| *a).collect();
+        if let Some((a, _, _, _)) = scored.iter().skip(slots).choose(&mut rand::rng()) {
+            in_slot.insert(*a);
+        }
+
+        // Apply: update round baselines and send Choke/Unchoke as needed.
+        // Collect (addr, counters) first: DashMap's iterator holds the shard
+        // lock, so calling with_live_mut (which takes the same lock) inside
+        // the iterator would deadlock.
+        let peers: Vec<(PeerHandle, Arc<AtomicPeerCounters>)> = self
+            .peers
+            .states
+            .iter()
+            .filter_map(|e| {
+                e.value()
+                    .get_live()
+                    .map(|_| (*e.key(), e.value().stats.counters.clone()))
+            })
+            .collect();
+        for (addr, c) in peers {
+            self.peers.with_live_mut(addr, "rechoke", |live| {
+                live.last_rechoke_uploaded = c.uploaded_bytes.load(Ordering::Relaxed);
+                live.last_rechoke_fetched = c.fetched_bytes.load(Ordering::Relaxed);
+                let want_unchoked = in_slot.contains(&addr);
+                if live.am_choking && want_unchoked {
+                    live.am_choking = false;
+                    let _ = live.tx.send(WriterRequest::Message(Message::Unchoke));
+                    trace!(?addr, "unchoked by rechoke");
+                } else if !live.am_choking && !want_unchoked {
+                    live.am_choking = true;
+                    let _ = live.tx.send(WriterRequest::Message(Message::Choke));
+                    trace!(?addr, "choked by rechoke");
+                }
+            });
+        }
+    }
+
     pub fn torrent(&self) -> &ManagedTorrentShared {
         &self.shared
     }
@@ -1040,6 +1147,14 @@ const DEFAULT_FIRST_WAVE_PEERS: u32 = 30;
 /// transmission `MaxBadPiecesPerPeer`).
 const DEFAULT_MAX_BAD_PIECES_PER_PEER: u32 = 5;
 
+/// Number of unchoke slots per torrent (aligned with libtorrent
+/// `unchoke_slots_limit` and transmission `upload_slots_per_torrent`).
+const DEFAULT_UNCHOKE_SLOTS: u32 = 8;
+
+/// Period of the tit-for-tat rechoke task in seconds (aligned with
+/// transmission `RechokePeriod`).
+const DEFAULT_RECHOKE_INTERVAL_SECS: u64 = 10;
+
 struct PeerFlowControl {
     i_am_choked: bool,
     request_window: usize,
@@ -1263,6 +1378,16 @@ impl PeerConnectionHandler for &'_ PeerHandler {
         self.state.get_approx_have_bytes() > 0
     }
 
+    fn should_unchoke(&self) -> bool {
+        // We unchoke a peer only when the rechoke task has put it in a slot
+        // (am_choking == false). Defaults to choked on connect.
+        !self
+            .state
+            .peers
+            .with_live(self.addr, |live| live.am_choking)
+            .unwrap_or(true)
+    }
+
     fn should_transmit_have(&self, id: ValidPieceIndex) -> bool {
         if self.state.shared.options.disable_upload() {
             return false;
@@ -1463,7 +1588,14 @@ impl PeerHandler {
             return Ok(None);
         }
 
-        // Steal info to process after releasing the peer lock
+        // Piece replication counts for rarest-first ordering. Computed once
+        // per acquire (cached inside PeerStates for a short window).
+        let rarity_counts = self
+            .state
+            .peers
+            .piece_rarity_counts(self.state.lengths.total_pieces() as usize);
+
+        // Steal info to process after releasing the peer lock.
         let mut steal_info: Option<(SocketAddr, ValidPieceIndex)> = None;
 
         let result = self
@@ -1492,6 +1624,7 @@ impl PeerHandler {
                             .try_write()
                             .is_some()
                     },
+                    piece_rarity: |p| rarity_counts[p.get() as usize],
                 });
 
                 match result {
@@ -1522,6 +1655,18 @@ impl PeerHandler {
     fn on_download_request(&self, request: Request) -> anyhow::Result<()> {
         if self.state.torrent().options.disable_upload() {
             anyhow::bail!("upload disabled, but peer requested a piece")
+        }
+
+        // We are choking this peer: ignore its upload requests (tit-for-tat).
+        // It will learn from our Choke message and stop requesting.
+        if self
+            .state
+            .peers
+            .with_live(self.addr, |live| live.am_choking)
+            .unwrap_or(true)
+        {
+            trace!(?request, "ignoring request from choked peer");
+            return Ok(());
         }
 
         let piece_index = match self.state.lengths.validate_piece_index(request.index) {
@@ -1799,6 +1944,10 @@ impl PeerHandler {
     fn on_peer_interested(&self) {
         trace!("peer is interested");
         self.state.peers.mark_peer_interested(self.addr, true);
+        // A newly interested peer shouldn't wait up to a full rechoke period
+        // for an unchoke slot (e.g. streaming / small downloads); recompute
+        // slots immediately.
+        self.state.rechoke_round();
     }
 
     fn on_i_am_unchoked(&self) {
