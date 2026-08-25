@@ -157,14 +157,12 @@ impl PieceTracker {
             }
         }
 
-        // Then check queued pieces, ordered rarest-first: stable sort by the
-        // per-peer replication count ascending (ties keep the file-priority
-        // order from iter_queued_pieces). The peer must hold the piece.
-        let mut queued: Vec<_> = self
+        // Then check queued pieces in file-priority order (rarest-first
+        // disabled for isolation testing). The peer must hold the piece.
+        let queued: Vec<_> = self
             .chunks
             .iter_queued_pieces(req.file_priorities, req.file_infos)
             .collect();
-        queued.sort_by_key(|p| (req.piece_rarity)(*p));
 
         for piece in queued {
             if (req.peer_has_piece)(piece) {
