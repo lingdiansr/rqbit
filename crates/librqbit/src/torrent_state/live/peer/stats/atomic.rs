@@ -23,6 +23,10 @@ pub(crate) struct PeerCountersAtomic {
     pub total_piece_download_ms: AtomicU64,
     pub times_stolen_from_me: AtomicU32,
     pub times_i_stole: AtomicU32,
+    /// Cumulative count of pieces whose hash failed to validate, used to
+    /// decide whether to disconnect the peer (aligned with transmission
+    /// `MaxBadPiecesPerPeer`).
+    pub bad_pieces: AtomicU32,
 }
 
 impl PeerCountersAtomic {

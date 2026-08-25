@@ -115,8 +115,16 @@ pub(crate) struct ManagedTorrentOptions {
     pub mse_mode: crate::mse::MseMode,
     /// Outgoing connection attempts per second cap; None = unlimited.
     pub connect_rate: Option<u32>,
+    /// How many of the first peers (e.g. from the first tracker response or
+    /// initial DHT batch) bypass the `connect_rate` throttle for a cold-start
+    /// boost. Defaults to 30 when None (aligned with libtorrent
+    /// `torrent_connect_boost`).
+    pub first_wave_peers: Option<u32>,
     /// Backoff config for dead outgoing peers; None = upstream defaults.
     pub peer_backoff: Option<crate::PeerBackoffConfig>,
+    /// Max bad pieces a peer may send before being disconnected. Defaults to
+    /// 5 when None (aligned with transmission `MaxBadPiecesPerPeer`).
+    pub max_bad_pieces_per_peer: Option<u32>,
     pub allow_overwrite: bool,
     pub output_folder: PathBuf,
     pub ratelimits: LimitsConfig,

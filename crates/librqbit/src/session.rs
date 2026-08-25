@@ -108,6 +108,9 @@ impl SessionDatabase {
     }
 }
 
+/// Global cap on outgoing peer connections across all torrents in a session.
+const DEFAULT_GLOBAL_PEER_LIMIT: usize = 200;
+
 pub struct Session {
     // Core state and services
     pub(crate) db: RwLock<SessionDatabase>,
@@ -140,6 +143,9 @@ pub struct Session {
 
     // Limits and throttling
     pub(crate) concurrent_initialize_semaphore: Arc<tokio::sync::Semaphore>,
+    /// Global cap on outgoing peer connections across all torrents in this
+    /// session (acquired before the per-torrent `peer_semaphore`).
+    pub(crate) global_peer_semaphore: Arc<tokio::sync::Semaphore>,
     pub ratelimits: Limits,
 
     pub blocklist: IpRanges,
@@ -286,8 +292,18 @@ pub struct AddTorrentOptions {
     /// Initial peers to start of with.
     pub initial_peers: Option<Vec<SocketAddr>>,
 
+    /// How many of the first peers bypass the `connect_rate` throttle for a
+    /// cold-start boost. `None` uses the session/torrent default (30).
+    #[serde(default)]
+    pub first_wave_peers: Option<u32>,
+
     /// Max concurrent connected peers.
     pub peer_limit: Option<usize>,
+
+    /// Max bad pieces a peer may send before being disconnected. `None` uses
+    /// the session/torrent default (5).
+    #[serde(default)]
+    pub max_bad_pieces_per_peer: Option<u32>,
 
     /// This is used to restore the session from serialized state.
     pub preferred_id: Option<usize>,
@@ -473,6 +489,12 @@ pub struct SessionOptions {
     /// Default peer limit per torrent.
     pub peer_limit: Option<usize>,
 
+    /// Global cap on outgoing peer connections across all torrents in the
+    /// session. `None` uses the default (200, aligned with
+    /// libtorrent/transmission). The per-torrent `peer_limit` still applies
+    /// on top of this.
+    pub global_peer_limit: Option<usize>,
+
     #[cfg(feature = "disable-upload")]
     pub disable_upload: bool,
 
@@ -516,6 +538,7 @@ impl Default for SessionOptions {
             allowlist_url: None,
             trackers: HashSet::new(),
             peer_limit: None,
+            global_peer_limit: None,
             #[cfg(feature = "disable-upload")]
             disable_upload: false,
             disable_local_service_discovery: false,
@@ -818,6 +841,9 @@ impl Session {
                 stats: Arc::new(SessionStats::new()),
                 concurrent_initialize_semaphore: Arc::new(tokio::sync::Semaphore::new(
                     opts.concurrent_init_limit.unwrap_or(3),
+                )),
+                global_peer_semaphore: Arc::new(tokio::sync::Semaphore::new(
+                    opts.global_peer_limit.unwrap_or(DEFAULT_GLOBAL_PEER_LIMIT),
                 )),
                 udp_tracker_client,
                 ratelimits: Limits::new(opts.ratelimits),
@@ -1481,6 +1507,8 @@ impl Session {
                     peer_read_write_timeout: peer_opts.read_write_timeout,
                     mse_mode: self.mse_mode,
                     connect_rate: peer_opts.connect_rate,
+                    first_wave_peers: opts.first_wave_peers,
+                    max_bad_pieces_per_peer: opts.max_bad_pieces_per_peer,
                     peer_backoff: self.peer_backoff.clone(),
                     allow_overwrite: opts.overwrite,
                     output_folder,
