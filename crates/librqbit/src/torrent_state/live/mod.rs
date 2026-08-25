@@ -2244,9 +2244,9 @@ impl PeerHandler {
             //
 
             if !cfg!(feature = "_disable_disk_write_net_benchmark") {
-                // Coalesce into the piece write buffer instead of one pwrite
-                // per chunk; flushed once on piece completion.
-                state.buffer_chunk(chunk_info, piece.data());
+                // Isolation test: write each chunk directly to disk, bypassing
+                // the write-coalescing cache.
+                state.file_ops().write_chunk(addr, &piece, chunk_info)?;
             }
 
             let full_piece_download_time = {
