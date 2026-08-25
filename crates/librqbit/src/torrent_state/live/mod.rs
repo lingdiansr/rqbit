@@ -346,6 +346,12 @@ impl TorrentStateLive {
             format!("[{}]rechoke", state.shared.id),
             state.clone().task_rechoke(),
         );
+
+        state.spawn(
+            debug_span!(parent: state.shared.span.clone(), "chunk_timeout_checker"),
+            format!("[{}]chunk_timeout_checker", state.shared.id),
+            state.clone().task_chunk_request_timeout_checker(),
+        );
         Ok(state)
     }
 
@@ -804,6 +810,70 @@ impl TorrentStateLive {
         }
     }
 
+    /// Periodically expire stalled chunk requests: cancel them, requeue the
+    /// piece so another peer (or a retry) can pick it up, and snub the peer
+    /// so it gets no new piece requests for a while.
+    async fn task_chunk_request_timeout_checker(self: Arc<Self>) -> crate::Result<()> {
+        let state = self;
+        let timeout = Duration::from_secs(
+            state
+                .shared
+                .options
+                .chunk_request_timeout_secs
+                .unwrap_or(DEFAULT_CHUNK_REQUEST_TIMEOUT_SECS),
+        );
+        let snub_duration = Duration::from_secs(
+            state
+                .shared
+                .options
+                .snub_duration_secs
+                .unwrap_or(DEFAULT_SNUB_DURATION_SECS),
+        );
+        let mut ticker = tokio::time::interval(CHUNK_TIMEOUT_CHECK_INTERVAL);
+        loop {
+            ticker.tick().await;
+            let addrs: Vec<PeerHandle> = state.peers.states.iter().map(|e| *e.key()).collect();
+            for addr in addrs {
+                let expired = state
+                    .peers
+                    .with_live_mut(addr, "expire chunk requests", |live| {
+                        let expired = live.expire_inflight_requests(timeout);
+                        if !expired.is_empty() {
+                            live.record_timeout(snub_duration);
+                            for chunk in &expired {
+                                let _ = live.tx.send(WriterRequest::Message(Message::Cancel(
+                                    Request {
+                                        index: chunk.piece_index.get(),
+                                        begin: chunk.offset,
+                                        length: chunk.size,
+                                    },
+                                )));
+                            }
+                        }
+                        expired
+                    })
+                    .unwrap_or_default();
+                if !expired.is_empty() {
+                    // Requeue each timed-out piece so it can be re-requested.
+                    let mut requeued = false;
+                    {
+                        let mut g = state.lock_write("timeout requeue");
+                        let pieces = g.get_pieces_mut()?;
+                        for chunk in &expired {
+                            if pieces.release_piece(chunk.piece_index, addr) {
+                                requeued = true;
+                            }
+                        }
+                    }
+                    if requeued {
+                        state.new_pieces_notify.notify_waiters();
+                        trace!(?addr, n = expired.len(), "expired stalled chunk requests");
+                    }
+                }
+            }
+        }
+    }
+
     pub fn torrent(&self) -> &ManagedTorrentShared {
         &self.shared
     }
@@ -1154,6 +1224,23 @@ const DEFAULT_UNCHOKE_SLOTS: u32 = 8;
 /// Period of the tit-for-tat rechoke task in seconds (aligned with
 /// transmission `RechokePeriod`).
 const DEFAULT_RECHOKE_INTERVAL_SECS: u64 = 10;
+
+/// Per-chunk request timeout before the request is cancelled and re-scheduled
+/// (aligned with transmission `RequestTimeoutSecs`).
+const DEFAULT_CHUNK_REQUEST_TIMEOUT_SECS: u64 = 25;
+
+/// How long a peer is snubbed after a chunk request timeout.
+const DEFAULT_SNUB_DURATION_SECS: u64 = 60;
+
+/// Enter end-game mode (second peer joins an in-flight piece) when the
+/// remaining queued pieces are at most this.
+const DEFAULT_ENDGAME_PIECE_THRESHOLD: usize = 20;
+
+/// Max peers downloading a single piece in end-game.
+const DEFAULT_ENDGAME_MAX_PEERS: usize = 2;
+
+/// How often the chunk request timeout checker runs.
+const CHUNK_TIMEOUT_CHECK_INTERVAL: Duration = Duration::from_secs(1);
 
 struct PeerFlowControl {
     i_am_choked: bool,
@@ -1576,13 +1663,26 @@ impl PeerHandler {
     }
 
     /// Acquire a piece for this peer: try steal (10x) → reserve → steal (3x).
-    ///
     /// Returns the piece index to download, or None if no pieces are available.
     fn acquire_next_piece(&self) -> crate::Result<Option<ValidPieceIndex>> {
         if self.is_choked() {
             debug!("we are choked, can't acquire piece");
             return Ok(None);
         }
+
+        // If this peer is snubbed (too many recent request timeouts), give it
+        // no new pieces for now; in-flight requests still get served.
+        if self
+            .state
+            .peers
+            .with_live(self.addr, |live| live.is_snubbed(Instant::now()))
+            .unwrap_or(false)
+        {
+            trace!("peer is snubbed, not requesting new pieces");
+            return Ok(None);
+        }
+
+        // Piece replication counts for rarest-first ordering. Computed once
 
         // Piece replication counts for rarest-first ordering. Computed once
         // per acquire (cached inside PeerStates for a short window).
@@ -1621,6 +1721,18 @@ impl PeerHandler {
                             .is_some()
                     },
                     piece_rarity: |p| rarity_counts[p.get() as usize],
+                    endgame_threshold: self
+                        .state
+                        .shared
+                        .options
+                        .endgame_piece_threshold
+                        .unwrap_or(DEFAULT_ENDGAME_PIECE_THRESHOLD),
+                    endgame_max_peers: self
+                        .state
+                        .shared
+                        .options
+                        .endgame_max_peers_per_piece
+                        .unwrap_or(DEFAULT_ENDGAME_MAX_PEERS),
                 });
 
                 match result {
@@ -2032,11 +2144,11 @@ impl PeerHandler {
                     .map(|l| l.read());
 
                 match g.get_pieces()?.get_inflight(chunk_info.piece_index) {
-                    Some(inflight) if inflight.peer == addr => {}
-                    Some(inflight) => {
+                    Some(inflight) if inflight.peers.iter().any(|(p, _)| *p == addr) => {}
+                    Some(_) => {
                         debug!(
-                            "in-flight piece {} was stolen by {}, ignoring",
-                            chunk_info.piece_index, inflight.peer
+                            "in-flight piece {} is not owned by us, ignoring",
+                            chunk_info.piece_index
                         );
                         return Ok(());
                     }
