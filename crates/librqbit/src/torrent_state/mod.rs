@@ -131,6 +131,18 @@ pub(crate) struct ManagedTorrentOptions {
     /// Period of the tit-for-tat rechoke task in seconds. Defaults to 10 when
     /// None (aligned with transmission `RechokePeriod`).
     pub rechoke_interval_secs: Option<u64>,
+    /// Per-chunk request timeout in seconds before a stalled request is
+    /// cancelled and re-scheduled (and the peer snubbed). Defaults to 25 when
+    /// None (aligned with transmission `RequestTimeoutSecs`).
+    pub chunk_request_timeout_secs: Option<u64>,
+    /// How long a peer is snubbed (gets no new piece requests) after a chunk
+    /// request timeout. Defaults to 60 when None.
+    pub snub_duration_secs: Option<u64>,
+    /// Enter end-game mode (second peer may join an in-flight piece) when the
+    /// remaining queued pieces are at most this. Defaults to 20 when None.
+    pub endgame_piece_threshold: Option<usize>,
+    /// Max peers downloading a single piece in end-game. Defaults to 2.
+    pub endgame_max_peers_per_piece: Option<usize>,
     pub allow_overwrite: bool,
     pub output_folder: PathBuf,
     pub ratelimits: LimitsConfig,

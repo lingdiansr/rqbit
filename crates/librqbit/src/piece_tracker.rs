@@ -24,11 +24,13 @@ use crate::{
     type_aliases::{FileInfos, FilePriorities, PeerHandle},
 };
 
-/// Tracks a piece currently being downloaded.
+/// Tracks a piece currently being downloaded. In normal operation a piece is
+/// downloaded by one peer; in end-game mode a second peer may join so the
+/// last blocks finish faster.
 #[derive(Debug, Clone)]
 pub struct InflightPiece {
-    pub peer: PeerHandle,
-    pub started: Instant,
+    /// The peers currently downloading this piece and when each started.
+    pub peers: Vec<(PeerHandle, Instant)>,
 }
 
 /// Result of attempting to acquire a piece.
@@ -70,6 +72,11 @@ where
     /// Returns how many peers hold the given piece (replication count), used
     /// to order queued pieces rarest-first.
     pub piece_rarity: R,
+    /// When the number of remaining queued pieces is at most this, end-game
+    /// mode is active and a second peer may join an in-flight piece.
+    pub endgame_threshold: usize,
+    /// Maximum number of peers that may download a single piece in end-game.
+    pub endgame_max_peers: usize,
 }
 
 /// Coordinates piece download state.
@@ -170,19 +177,41 @@ impl PieceTracker {
             return result;
         }
 
+        // 4. End-game: when few pieces remain queued, allow a second peer to
+        // join an in-flight piece so the last blocks finish faster (aligned
+        // with libtorrent request_blocks.cpp busy-block re-requesting).
+        let queue_count = self
+            .chunks
+            .iter_queued_pieces(req.file_priorities, req.file_infos)
+            .count();
+        if queue_count <= req.endgame_threshold {
+            for (piece, info) in &self.inflight {
+                if info.peers.len() < req.endgame_max_peers
+                    && !info.peers.iter().any(|(p, _)| *p == req.peer)
+                    && (req.peer_has_piece)(*piece)
+                {
+                    return self.reserve_piece(*piece, req.peer);
+                }
+            }
+        }
+
         AcquireResult::NoneAvailable
     }
 
-    /// Reserve a piece: remove from queue, add to inflight.
+    /// Reserve a piece: remove from queue, add to inflight. In end-game mode
+    /// a second peer may be appended to an already in-flight piece.
     fn reserve_piece(&mut self, piece: ValidPieceIndex, peer: PeerHandle) -> AcquireResult {
         self.chunks.reserve_needed_piece(piece);
-        self.inflight.insert(
-            piece,
-            InflightPiece {
-                peer,
-                started: Instant::now(),
-            },
-        );
+        if let Some(info) = self.inflight.get_mut(&piece) {
+            info.peers.push((peer, Instant::now()));
+        } else {
+            self.inflight.insert(
+                piece,
+                InflightPiece {
+                    peers: vec![(peer, Instant::now())],
+                },
+            );
+        }
         AcquireResult::Reserved(piece)
     }
 
@@ -202,13 +231,15 @@ impl PieceTracker {
         let min_elapsed = Duration::from_secs_f64(my_avg.as_secs_f64() * threshold);
 
         // Find the slowest piece from another peer that exceeds threshold
-        // and that the stealing peer actually has (can download)
+        // and that the stealing peer actually has (can download). Only steal
+        // single-owner pieces (not end-game multi-peer ones).
         let (piece, old_peer, _) = self
             .inflight
             .iter()
-            .filter(|(_, info)| info.peer != req.peer)
+            .filter(|(_, info)| info.peers.iter().all(|(p, _)| *p != req.peer))
+            .filter(|(_, info)| info.peers.len() == 1)
             .filter(|(p, _)| (req.peer_has_piece)(**p))
-            .map(|(p, info)| (*p, info.peer, info.started.elapsed()))
+            .map(|(p, info)| (*p, info.peers[0].0, info.peers[0].1.elapsed()))
             .filter(|(_, _, elapsed)| *elapsed >= min_elapsed)
             .max_by_key(|(_, _, elapsed)| *elapsed)?;
 
@@ -219,8 +250,7 @@ impl PieceTracker {
 
         // Update ownership (piece stays in inflight, just changes owner)
         let info = self.inflight.get_mut(&piece)?;
-        info.peer = req.peer;
-        info.started = Instant::now();
+        info.peers[0] = (req.peer, Instant::now());
 
         Some(AcquireResult::Stolen {
             piece,
@@ -237,7 +267,16 @@ impl PieceTracker {
     /// and then call `mark_piece_hash_ok` or `mark_piece_hash_failed`.
     pub fn take_inflight(&mut self, piece: ValidPieceIndex) -> Option<Duration> {
         let inflight = self.inflight.remove(&piece)?;
-        Some(inflight.started.elapsed())
+        // Use the earliest start time as the piece's download duration.
+        Some(
+            inflight
+                .peers
+                .iter()
+                .map(|(_, started)| *started)
+                .min()
+                .unwrap_or_else(Instant::now)
+                .elapsed(),
+        )
     }
 
     /// Mark piece as downloaded after successful hash verification.
@@ -250,6 +289,29 @@ impl PieceTracker {
         self.chunks.mark_piece_broken_if_not_have(piece);
     }
 
+    /// Release a single piece's request by `peer` (e.g. after its request
+    /// timed out). If no peer is left, the piece is requeued. Returns whether
+    /// the peer was tracking it.
+    pub fn release_piece(&mut self, piece: ValidPieceIndex, peer: PeerHandle) -> bool {
+        let was_tracking = if let Some(info) = self.inflight.get_mut(&piece) {
+            let before = info.peers.len();
+            info.peers.retain(|(p, _)| *p != peer);
+            before != info.peers.len()
+        } else {
+            false
+        };
+        if was_tracking
+            && self
+                .inflight
+                .get(&piece)
+                .is_some_and(|i| i.peers.is_empty())
+        {
+            self.inflight.remove(&piece);
+            self.chunks.mark_piece_broken_if_not_have(piece);
+        }
+        was_tracking
+    }
+
     /// Release all pieces owned by a peer (on peer death).
     ///
     /// Moves all pieces owned by the peer from IN_FLIGHT back to QUEUED.
@@ -259,14 +321,22 @@ impl PieceTracker {
         let pieces_to_release: Vec<_> = self
             .inflight
             .iter()
-            .filter(|(_, info)| info.peer == peer)
+            .filter(|(_, info)| info.peers.iter().any(|(p, _)| *p == peer))
             .map(|(p, _)| *p)
             .collect();
 
         let count = pieces_to_release.len();
         for piece in pieces_to_release {
-            self.inflight.remove(&piece);
-            self.chunks.mark_piece_broken_if_not_have(piece);
+            let empty = if let Some(info) = self.inflight.get_mut(&piece) {
+                info.peers.retain(|(p, _)| *p != peer);
+                info.peers.is_empty()
+            } else {
+                false
+            };
+            if empty {
+                self.inflight.remove(&piece);
+                self.chunks.mark_piece_broken_if_not_have(piece);
+            }
         }
         count
     }
@@ -408,6 +478,8 @@ mod tests {
             peer_has_piece: |_| true, // Peer has all pieces
             can_steal: |_| true,
             piece_rarity: |_| 0,
+            endgame_threshold: 0,
+            endgame_max_peers: 1,
         });
 
         // Should reserve piece 0 (first in queue)
@@ -442,6 +514,8 @@ mod tests {
             peer_has_piece: |p| p.get() >= 2,
             can_steal: |_| true,
             piece_rarity: |_| 0,
+            endgame_threshold: 0,
+            endgame_max_peers: 1,
         });
 
         match result {
@@ -471,6 +545,8 @@ mod tests {
             peer_has_piece: |_| true,
             can_steal: |_| true,
             piece_rarity: |_| 0,
+            endgame_threshold: 0,
+            endgame_max_peers: 1,
         });
 
         let piece = match result {
@@ -505,6 +581,8 @@ mod tests {
             peer_has_piece: |_| true,
             can_steal: |_| true,
             piece_rarity: |_| 0,
+            endgame_threshold: 0,
+            endgame_max_peers: 1,
         });
 
         let piece = match result {
@@ -534,6 +612,8 @@ mod tests {
             peer_has_piece: |p| p == piece, // Only has the failed piece
             can_steal: |_| true,
             piece_rarity: |_| 0,
+            endgame_threshold: 0,
+            endgame_max_peers: 1,
         });
 
         match result2 {
@@ -564,6 +644,8 @@ mod tests {
             peer_has_piece: |_| true,
             can_steal: |_| true,
             piece_rarity: |_| 0,
+            endgame_threshold: 0,
+            endgame_max_peers: 1,
         }) {
             AcquireResult::Reserved(p) => p,
             _ => panic!("Expected Reserved"),
@@ -577,6 +659,8 @@ mod tests {
             peer_has_piece: |_| true,
             can_steal: |_| true,
             piece_rarity: |_| 0,
+            endgame_threshold: 0,
+            endgame_max_peers: 1,
         }) {
             AcquireResult::Reserved(p) => p,
             _ => panic!("Expected Reserved"),
@@ -592,6 +676,8 @@ mod tests {
             peer_has_piece: |_| true,
             can_steal: |_| true,
             piece_rarity: |_| 0,
+            endgame_threshold: 0,
+            endgame_max_peers: 1,
         }) {
             AcquireResult::Reserved(p) => p,
             _ => panic!("Expected Reserved"),
@@ -632,6 +718,8 @@ mod tests {
             peer_has_piece: |_| true,
             can_steal: |_| true,
             piece_rarity: |_| 0,
+            endgame_threshold: 0,
+            endgame_max_peers: 1,
         });
         tracker.acquire_piece(AcquireRequest {
             peer: peer(1),
@@ -642,6 +730,8 @@ mod tests {
             peer_has_piece: |_| true,
             can_steal: |_| true,
             piece_rarity: |_| 0,
+            endgame_threshold: 0,
+            endgame_max_peers: 1,
         });
 
         assert_eq!(tracker.inflight_count(), 2);
@@ -660,6 +750,8 @@ mod tests {
             peer_has_piece: |_| true,
             can_steal: |_| true,
             piece_rarity: |_| 0,
+            endgame_threshold: 0,
+            endgame_max_peers: 1,
         });
 
         // Should get piece 0 again (was requeued)
@@ -699,6 +791,8 @@ mod tests {
             peer_has_piece: |_| true,
             can_steal: |_| true,
             piece_rarity: |_| 0,
+            endgame_threshold: 0,
+            endgame_max_peers: 1,
         });
 
         // Should get piece 3 (first priority piece)
@@ -726,6 +820,8 @@ mod tests {
             peer_has_piece: |_| false, // Peer has nothing
             can_steal: |_| true,
             piece_rarity: |_| 0,
+            endgame_threshold: 0,
+            endgame_max_peers: 1,
         });
 
         match result {
@@ -775,6 +871,8 @@ mod tests {
             peer_has_piece: |_| true,
             can_steal: |_| true,
             piece_rarity: |_| 0,
+            endgame_threshold: 0,
+            endgame_max_peers: 1,
         }) {
             AcquireResult::Reserved(p) => {
                 assert_eq!(p.get(), 0);
@@ -792,6 +890,8 @@ mod tests {
             peer_has_piece: |_| true,
             can_steal: |_| true,
             piece_rarity: |_| 0,
+            endgame_threshold: 0,
+            endgame_max_peers: 1,
         }) {
             AcquireResult::Reserved(p) => {
                 assert_eq!(p.get(), 4);
@@ -815,6 +915,8 @@ mod tests {
             peer_has_piece: |p| p.get() == 4, // Peer B only has piece 4
             can_steal: |_| true,
             piece_rarity: |_| 0,
+            endgame_threshold: 0,
+            endgame_max_peers: 1,
         });
 
         // Should steal piece 4 (which peer B has), NOT piece 0 (which peer B doesn't have)
@@ -823,7 +925,14 @@ mod tests {
                 assert_eq!(piece, piece_4, "Should steal piece 4 (the one peer B has)");
                 assert_eq!(from_peer, peer_a);
                 // Verify piece 0 is still owned by peer A (wasn't stolen)
-                assert_eq!(tracker.get_inflight(piece_0).unwrap().peer, peer_a);
+                assert!(
+                    tracker
+                        .get_inflight(piece_0)
+                        .unwrap()
+                        .peers
+                        .iter()
+                        .any(|(p, _)| *p == peer_a)
+                );
             }
             _ => panic!("Expected Stolen, got {:?}", result),
         }

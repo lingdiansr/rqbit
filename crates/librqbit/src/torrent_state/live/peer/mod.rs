@@ -1,8 +1,9 @@
 pub mod stats;
 
-use std::collections::HashSet;
+use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::sync::{Arc, atomic::Ordering};
+use std::time::{Duration, Instant};
 
 use librqbit_core::hash_id::Id20;
 use librqbit_core::lengths::{ChunkInfo, ValidPieceIndex};
@@ -20,7 +21,6 @@ use crate::type_aliases::BF;
 
 use super::PeerStates;
 
-pub(crate) type InflightRequest = ChunkInfo;
 pub(crate) type PeerRx = UnboundedReceiver<WriterRequest>;
 pub(crate) type PeerTx = UnboundedSender<WriterRequest>;
 
@@ -263,8 +263,14 @@ pub(crate) struct LivePeerState {
     // This is used to track the pieces the peer has.
     pub bitfield: BF,
 
-    // When the peer sends us data this is used to track if we asked for it.
-    inflight_requests: HashSet<InflightRequest>,
+    // Chunks we have requested from this peer and when, so a request that
+    // stalls can be timed out and re-scheduled elsewhere.
+    inflight_requests: HashMap<ChunkInfo, Instant>,
+
+    // When set, we stop requesting new pieces from this peer until this time
+    // (after too many request timeouts).
+    snubbed_until: Option<Instant>,
+    chunk_timeouts: u32,
 
     // Bounded tolerance for chunks that arrive after we cancel requests.
     // This is intentionally approximate: we track a count instead of storing every
@@ -308,6 +314,8 @@ impl LivePeerState {
             am_choking: true,
             last_rechoke_uploaded: 0,
             last_rechoke_fetched: 0,
+            snubbed_until: None,
+            chunk_timeouts: 0,
         }
     }
 
@@ -324,11 +332,13 @@ impl LivePeerState {
     }
 
     pub fn add_inflight_request(&mut self, chunk: ChunkInfo) -> bool {
-        self.inflight_requests.insert(chunk)
+        self.inflight_requests
+            .insert(chunk, Instant::now())
+            .is_none()
     }
 
     pub fn remove_inflight_request(&mut self, chunk: &ChunkInfo) -> RemoveInflightRequestResult {
-        if self.inflight_requests.remove(chunk) {
+        if self.inflight_requests.remove(chunk).is_some() {
             self.request_slots_changed.notify_waiters();
             return RemoveInflightRequestResult::Expected;
         }
@@ -347,7 +357,7 @@ impl LivePeerState {
         let tx = &self.tx;
         let late_cancelled_request_tolerance = &mut self.late_cancelled_request_tolerance;
         let before = self.inflight_requests.len();
-        self.inflight_requests.retain(|req| {
+        self.inflight_requests.retain(|req, _| {
             if req.piece_index == piece {
                 let _ = tx.send(WriterRequest::Message(Message::Cancel(Request {
                     index: piece.get(),
@@ -366,12 +376,42 @@ impl LivePeerState {
         }
     }
 
-    pub fn inflight_requests(&self) -> impl Iterator<Item = &InflightRequest> {
-        self.inflight_requests.iter()
+    pub fn inflight_requests(&self) -> impl Iterator<Item = &ChunkInfo> {
+        self.inflight_requests.keys()
     }
 
-    pub fn inflight_requests_debug(&self) -> &HashSet<InflightRequest> {
+    pub fn inflight_requests_debug(&self) -> &HashMap<ChunkInfo, Instant> {
         &self.inflight_requests
+    }
+
+    /// Return chunks whose request has been outstanding for longer than
+    /// `timeout`, removing them from the inflight set.
+    pub fn expire_inflight_requests(&mut self, timeout: Duration) -> Vec<ChunkInfo> {
+        let now = Instant::now();
+        let expired: Vec<ChunkInfo> = self
+            .inflight_requests
+            .iter()
+            .filter(|(_, sent_at)| now.duration_since(**sent_at) >= timeout)
+            .map(|(chunk, _)| *chunk)
+            .collect();
+        for chunk in &expired {
+            self.inflight_requests.remove(chunk);
+        }
+        if !expired.is_empty() {
+            self.request_slots_changed.notify_waiters();
+        }
+        expired
+    }
+
+    /// Mark the peer as snubbed for `duration` (it gets no new piece
+    /// requests meanwhile). Tracks cumulative chunk timeouts.
+    pub fn record_timeout(&mut self, duration: Duration) {
+        self.chunk_timeouts += 1;
+        self.snubbed_until = Some(Instant::now() + duration);
+    }
+
+    pub fn is_snubbed(&self, now: Instant) -> bool {
+        self.snubbed_until.is_some_and(|t| t > now)
     }
 }
 
