@@ -1,14 +1,7 @@
-//! Message Stream Encryption (MSE) support.
-//!
-//! MSE obfuscates the BitTorrent handshake and stream with RC4 and a DH-768
-//! key exchange (Azureus protocol encryption). Some peers (Xunlei, BitComet,
-//! etc.) refuse plaintext handshakes, so MSE is required to talk to them.
-//!
-//! This module is built top-down: the [`MseMode`] config and the peer
-//! connection wiring landed first, then the incoming (responder) handshake,
-//! and the outgoing (initiator) handshake in a follow-up commit.
+//! Message Stream Encryption (MSE) handshake.
 
 pub mod dh768;
+pub mod rc4;
 pub mod stream;
 
 use std::time::Duration;
@@ -17,10 +10,10 @@ use anyhow::{Context, Result, bail};
 use rand::{Rng, RngExt};
 use sha1w::{ISha1, Sha1};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
-use tracing::{debug, trace, warn};
+use tracing::{debug, info, warn};
 
-use ::rc4::{KeyInit, Rc4, StreamCipher};
 use dh768::Dh768;
+use rc4::Rc4;
 use stream::{Rc4Reader, Rc4Writer};
 
 const BT_PROTOCOL_PREFIX: &[u8; 20] = b"\x13BitTorrent protocol";
@@ -29,33 +22,24 @@ const MAX_PAD: usize = 512;
 const VC_LEN: usize = 8;
 const CRYPTO_RC4: u32 = 2;
 
+/// How MSE is applied to peer connections.
+///
+/// `Disabled` skips MSE entirely (plaintext only). `Enabled` (the default)
+/// prefers MSE and falls back to a plaintext redial on failure. `Forced`
+/// requires MSE: any peer that does not complete the MSE handshake is dropped.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub enum MseMode {
+    Disabled,
+    #[default]
+    Enabled,
+    Forced,
+}
+
 /// How long to wait (after sending Ya + PadA) for a peer to send its first 20
 /// bytes before treating it as a silent MSE responder. A plaintext peer sends
 /// its 68-byte BT handshake immediately, so we detect it here instead of
 /// waiting for the full read/write timeout.
 const PLAINTEXT_SNIFF_TIMEOUT: Duration = Duration::from_secs(2);
-
-/// How MSE is applied to peer connections.
-///
-/// `Disabled` (the default) skips MSE entirely (plaintext only). `Enabled`
-/// prefers MSE and falls back to a plaintext redial on failure. `Forced`
-/// requires MSE: any peer that does not complete the MSE handshake is dropped.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
-pub enum MseMode {
-    Disabled,
-    Enabled,
-    Forced,
-}
-
-// Manual impl rather than `#[derive(Default)]` + `#[default]`: keeping the
-// default explicit here avoids silently carrying a `#[default]` annotation
-// over if the default is ever flipped to another variant.
-#[allow(clippy::derivable_impls)]
-impl Default for MseMode {
-    fn default() -> Self {
-        Self::Disabled
-    }
-}
 
 pub struct PrefixReader<R> {
     prefix: Vec<u8>,
@@ -90,9 +74,6 @@ impl<R: AsyncRead + Unpin> AsyncRead for PrefixReader<R> {
     }
 }
 
-/// Encrypted carries the RC4 state and the full handshake; Plaintext is the
-/// fast path. The size gap is inherent to holding cipher state, not a defect.
-#[allow(clippy::large_enum_variant)]
 pub enum IncomingOutcome<R, W> {
     Encrypted {
         read: Rc4Reader<R>,
@@ -106,8 +87,6 @@ pub enum IncomingOutcome<R, W> {
     },
 }
 
-/// Encrypted carries the RC4-wrapped streams; PlaintextPeer carries none.
-#[allow(clippy::large_enum_variant)]
 pub enum OutgoingOutcome<R, W> {
     /// MSE handshake completed; use the RC4-wrapped streams.
     Encrypted(Rc4Reader<R>, Rc4Writer<W>),
@@ -132,7 +111,7 @@ fn xor20(a: &[u8; 20], b: &[u8; 20]) -> [u8; 20] {
     result
 }
 
-fn derive_keys(secret: &[u8], skey: &[u8], outgoing: bool) -> (Rc4, Rc4, [u8; 20]) {
+fn derive_keys(secret: &[u8], skey: &[u8], outgoing: bool) -> (Rc4, Rc4) {
     let (encrypt_key, decrypt_key) = if outgoing {
         (
             sha1(&[b"keyA", secret, skey]),
@@ -144,13 +123,11 @@ fn derive_keys(secret: &[u8], skey: &[u8], outgoing: bool) -> (Rc4, Rc4, [u8; 20
             sha1(&[b"keyA", secret, skey]),
         )
     };
-    let mut encrypt = Rc4::new_from_slice(&encrypt_key).expect("20-byte RC4 key");
-    let mut decrypt = Rc4::new_from_slice(&decrypt_key).expect("20-byte RC4 key");
-    // MSE drop-1024: discard the first 1024 keystream bytes.
-    let mut drop = [0u8; 1024];
-    encrypt.apply_keystream(&mut drop);
-    decrypt.apply_keystream(&mut drop);
-    (encrypt, decrypt, decrypt_key)
+    let mut encrypt = Rc4::new(&encrypt_key);
+    let mut decrypt = Rc4::new(&decrypt_key);
+    encrypt.discard(1024);
+    decrypt.discard(1024);
+    (encrypt, decrypt)
 }
 
 async fn read_scan_for_needle<R: AsyncRead + Unpin>(
@@ -244,12 +221,12 @@ where
     let dh = Dh768::generate(&mut rand::rng());
     write.write_all(&dh.public_key_bytes()).await?;
     write.write_all(&random_pad(MAX_PAD)).await?;
-    trace!("sent MSE Ya + PadA, probing responder");
+    debug!("sent MSE Ya + PadA, probing responder");
 
     // Sniff for a plaintext responder before committing to MSE.
     let (plaintext, sniffed) = sniff_plaintext(&mut read).await?;
     if plaintext.is_some() {
-        debug!(
+        info!(
             "peer answered with plaintext BT handshake within sniff window, falling back to plaintext redial"
         );
         return Ok(OutgoingOutcome::PlaintextPeer);
@@ -263,7 +240,7 @@ where
     let secret = dh
         .shared_secret(&server_public)
         .ok_or_else(|| anyhow::anyhow!("MSE degenerate remote DH key"))?;
-    let (mut encrypt, decrypt_base, decrypt_key) = derive_keys(&secret, info_hash, true);
+    let (mut encrypt, decrypt_base) = derive_keys(&secret, info_hash, true);
 
     write.write_all(&sha1(&[b"req1", &secret])).await?;
     let skey_hash = sha1(&[b"req2", info_hash]);
@@ -275,51 +252,40 @@ where
         Vec::with_capacity(VC_LEN + 4 + 2 + pad_c.len() + 2 + initial_payload.len());
     encrypted.extend_from_slice(&[0u8; VC_LEN]);
     encrypted.extend_from_slice(&CRYPTO_RC4.to_be_bytes());
-    encrypted.extend_from_slice(&u16::try_from(pad_c.len()).expect("pad_c <= MAX_PAD").to_be_bytes());
+    encrypted.extend_from_slice(&(pad_c.len() as u16).to_be_bytes());
     encrypted.extend_from_slice(&pad_c);
-    encrypted.extend_from_slice(&u16::try_from(BT_HANDSHAKE_LEN).expect("handshake <= 65535").to_be_bytes());
+    encrypted.extend_from_slice(&(BT_HANDSHAKE_LEN as u16).to_be_bytes());
     encrypted.extend_from_slice(initial_payload);
     encrypt.apply_keystream(&mut encrypted);
     write.write_all(&encrypted).await?;
 
-    // PadB is plaintext of unknown length followed by the encrypted VC. Rather
-    // than probing each offset with a cloned decrypt state (libtorrent does the
-    // same), compute the encrypted-VC pattern once and search the raw bytes for
-    // it (matching libtorrent `read_pe_syncvc` / transmission `read_vc`). The
-    // VC is the first 8 keystream bytes of the decrypt stream, so after the
-    // search `decrypt` continues from exactly the right position.
-    let vc_pattern = {
-        let mut pattern = [0u8; VC_LEN];
-        let mut probe = Rc4::new_from_slice(&decrypt_key).expect("20-byte RC4 key");
-        let mut drop = [0u8; 1024];
-        probe.apply_keystream(&mut drop);
-        probe.apply_keystream(&mut pattern);
-        pattern
-    };
+    // PadB is raw bytes. Scan with cloned decrypt states so rejected offsets do
+    // not consume the formal RC4 stream; commit only after encrypted VC matches.
     let mut raw = Vec::with_capacity(MAX_PAD + VC_LEN);
+    let mut candidate_decrypt = None;
     while raw.len() < MAX_PAD + VC_LEN {
         let mut byte = [0u8; 1];
         read.read_exact(&mut byte).await?;
         raw.push(byte[0]);
-        if raw.len() >= VC_LEN && raw[raw.len() - VC_LEN..] == vc_pattern {
-            break;
+        if raw.len() >= VC_LEN {
+            let offset = raw.len() - VC_LEN;
+            let mut candidate = decrypt_base.clone();
+            let mut vc = [0u8; VC_LEN];
+            vc.copy_from_slice(&raw[offset..]);
+            candidate.apply_keystream(&mut vc);
+            if vc == [0u8; VC_LEN] {
+                candidate_decrypt = Some(candidate);
+                break;
+            }
         }
     }
-    if raw.len() < VC_LEN || raw[raw.len() - VC_LEN..] != vc_pattern {
-        warn!("MSE verification constant not found within PadB, aborting handshake");
-        bail!("MSE verification constant not found within PadB");
-    }
-    let mut decrypt = decrypt_base;
-    // The VC is the first 8 keystream bytes of the decrypt stream. Decrypt the
-    // actual received VC ciphertext (raw's tail) and confirm it is the all-zero
-    // verification constant, which also advances the stream to the
-    // crypto-select / pad-length fields that follow.
-    let mut vc = raw[raw.len() - VC_LEN..].to_vec();
-    decrypt.apply_keystream(&mut vc);
-    if vc != [0u8; VC_LEN] {
-        warn!("MSE invalid verification constant after PadB, aborting handshake");
-        bail!("MSE invalid verification constant");
-    }
+    let mut decrypt = match candidate_decrypt {
+        Some(d) => d,
+        None => {
+            warn!("MSE verification constant not found within PadB, aborting handshake");
+            bail!("MSE verification constant not found within PadB");
+        }
+    };
 
     let mut select = [0u8; 4];
     read_encrypted(&mut read, &mut decrypt, &mut select).await?;
@@ -336,7 +302,7 @@ where
     let mut pad_d = vec![0u8; pad_length];
     read_encrypted(&mut read, &mut decrypt, &mut pad_d).await?;
 
-    trace!("MSE outgoing handshake complete, RC4 established");
+    info!("MSE outgoing handshake complete, RC4 established");
     Ok(OutgoingOutcome::Encrypted(
         Rc4Reader::new(read, decrypt),
         Rc4Writer::new(write, encrypt),
@@ -365,7 +331,7 @@ where
         }
     }
     if prefix.len() == BT_PROTOCOL_PREFIX.len() {
-        debug!("peer sent plaintext BT handshake, using plaintext path");
+        info!("peer sent plaintext BT handshake, using plaintext path");
         return Ok(IncomingOutcome::Plaintext {
             read: PrefixReader::new(prefix, read),
             write,
@@ -394,7 +360,7 @@ where
     let skey_hash = xor20(&obfuscated_skey, &sha1(&[b"req3", &secret]));
     let info_hash =
         lookup(&skey_hash).ok_or_else(|| anyhow::anyhow!("MSE unknown info hash in SKEY"))?;
-    let (mut encrypt, mut decrypt, _decrypt_key) = derive_keys(&secret, &info_hash, false);
+    let (mut encrypt, mut decrypt) = derive_keys(&secret, &info_hash, false);
 
     let mut vc = [0u8; VC_LEN];
     read_encrypted(&mut read, &mut decrypt, &mut vc).await?;
@@ -431,7 +397,7 @@ where
     let mut response = Vec::with_capacity(VC_LEN + 4 + 2 + pad_d.len());
     response.extend_from_slice(&[0u8; VC_LEN]);
     response.extend_from_slice(&CRYPTO_RC4.to_be_bytes());
-    response.extend_from_slice(&u16::try_from(pad_d.len()).expect("pad_d <= MAX_PAD").to_be_bytes());
+    response.extend_from_slice(&(pad_d.len() as u16).to_be_bytes());
     response.extend_from_slice(&pad_d);
     encrypt.apply_keystream(&mut response);
     write.write_all(&response).await?;
@@ -440,7 +406,7 @@ where
     read_encrypted(&mut read, &mut decrypt, &mut remaining).await?;
     handshake_bytes.extend_from_slice(&remaining);
 
-    trace!("MSE incoming handshake complete, RC4 established");
+    info!("MSE incoming handshake complete, RC4 established");
     Ok(IncomingOutcome::Encrypted {
         read: Rc4Reader::new(read, decrypt),
         write: Rc4Writer::new(write, encrypt),
@@ -450,4 +416,257 @@ where
 }
 
 #[cfg(test)]
-mod tests;
+mod tests {
+    use super::*;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt, duplex};
+
+    fn handshake(info_hash: [u8; 20], peer_id: [u8; 20]) -> [u8; 68] {
+        let mut bytes = [0u8; 68];
+        bytes[..20].copy_from_slice(BT_PROTOCOL_PREFIX);
+        bytes[28..48].copy_from_slice(&info_hash);
+        bytes[48..].copy_from_slice(&peer_id);
+        bytes
+    }
+
+    #[tokio::test]
+    async fn duplex_handshake_preserves_payload() -> Result<()> {
+        let info_hash = [0x42; 20];
+        let initial = handshake(info_hash, [0x11; 20]);
+        let (client, server) = duplex(8192);
+        let (client_read, client_write) = tokio::io::split(client);
+        let (server_read, server_write) = tokio::io::split(server);
+
+        let initiator = outgoing(client_read, client_write, &info_hash, &initial);
+        let responder = incoming(server_read, server_write, |candidate| {
+            (candidate == &sha1(&[b"req2", &info_hash])).then_some(info_hash)
+        });
+        let (initiator_result, responder_result) = tokio::join!(initiator, responder);
+        let (mut client_read, mut client_write) = match initiator_result? {
+            OutgoingOutcome::Encrypted(r, w) => (r, w),
+            OutgoingOutcome::PlaintextPeer => bail!("unexpected plaintext peer"),
+        };
+        let outcome = responder_result?;
+        let (mut server_read, mut server_write, received) = match outcome {
+            IncomingOutcome::Encrypted {
+                read,
+                write,
+                handshake_bytes,
+                ..
+            } => (read, write, handshake_bytes),
+            IncomingOutcome::Plaintext { .. } => bail!("unexpected plaintext outcome"),
+        };
+        assert_eq!(received, initial);
+
+        client_write.write_all(b"client payload").await?;
+        let mut client_payload = [0u8; 14];
+        server_read.read_exact(&mut client_payload).await?;
+        assert_eq!(&client_payload, b"client payload");
+
+        server_write.write_all(b"server payload").await?;
+        let mut server_payload = [0u8; 14];
+        client_read.read_exact(&mut server_payload).await?;
+        assert_eq!(&server_payload, b"server payload");
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn incoming_accepts_zero_length_ia_before_full_handshake() -> Result<()> {
+        let info_hash = [0x42; 20];
+        let expected_skey_hash = sha1(&[b"req2", &info_hash]);
+        let expected_handshake = handshake(info_hash, *b"-RQ0001-012345678901");
+        let (client, server) = duplex(4096);
+        let (mut client_read, mut client_write) = tokio::io::split(client);
+        let (server_read, server_write) = tokio::io::split(server);
+
+        let responder = tokio::spawn(async move {
+            incoming(server_read, server_write, move |skey_hash| {
+                (*skey_hash == expected_skey_hash).then_some(info_hash)
+            })
+            .await
+        });
+
+        let initiator_dh = Dh768::from_secret([0x37; 20]);
+        client_write
+            .write_all(&initiator_dh.public_key_bytes())
+            .await?;
+        let mut responder_public = [0u8; 96];
+        client_read.read_exact(&mut responder_public).await?;
+        let secret = initiator_dh
+            .shared_secret(&responder_public)
+            .context("responder returned an invalid DH key")?;
+        let (mut encrypt, mut decrypt) = derive_keys(&secret, &info_hash, true);
+
+        client_write.write_all(&sha1(&[b"req1", &secret])).await?;
+        let req3 = sha1(&[b"req3", &secret]);
+        client_write
+            .write_all(&xor20(&expected_skey_hash, &req3))
+            .await?;
+
+        let mut pe3 = Vec::new();
+        pe3.extend_from_slice(&[0u8; VC_LEN]);
+        pe3.extend_from_slice(&CRYPTO_RC4.to_be_bytes());
+        pe3.extend_from_slice(&0u16.to_be_bytes());
+        pe3.extend_from_slice(&0u16.to_be_bytes());
+        encrypt.apply_keystream(&mut pe3);
+        client_write.write_all(&pe3).await?;
+
+        let mut encrypted_vc = [0u8; VC_LEN];
+        let mut vc_probe = decrypt.clone();
+        vc_probe.apply_keystream(&mut encrypted_vc);
+        read_scan_for_needle(&mut client_read, &encrypted_vc, MAX_PAD).await?;
+        decrypt.apply_keystream(&mut encrypted_vc);
+        assert_eq!(encrypted_vc, [0u8; VC_LEN]);
+
+        let mut crypto_select = [0u8; 4];
+        client_read.read_exact(&mut crypto_select).await?;
+        decrypt.apply_keystream(&mut crypto_select);
+        assert_eq!(u32::from_be_bytes(crypto_select), CRYPTO_RC4);
+
+        let mut pad_d_length = [0u8; 2];
+        client_read.read_exact(&mut pad_d_length).await?;
+        decrypt.apply_keystream(&mut pad_d_length);
+        let mut pad_d = vec![0u8; u16::from_be_bytes(pad_d_length) as usize];
+        client_read.read_exact(&mut pad_d).await?;
+        decrypt.apply_keystream(&mut pad_d);
+
+        let mut encrypted_handshake = expected_handshake;
+        encrypt.apply_keystream(&mut encrypted_handshake);
+        client_write.write_all(&encrypted_handshake).await?;
+        let payload = b"post-handshake payload";
+        let mut encrypted_payload = *payload;
+        encrypt.apply_keystream(&mut encrypted_payload);
+        client_write.write_all(&encrypted_payload).await?;
+
+        let outcome = responder.await??;
+        match outcome {
+            IncomingOutcome::Encrypted {
+                mut read,
+                handshake_bytes,
+                info_hash: resolved_info_hash,
+                ..
+            } => {
+                assert_eq!(resolved_info_hash, info_hash);
+                assert_eq!(handshake_bytes, expected_handshake);
+                let mut received_payload = [0u8; 22];
+                read.read_exact(&mut received_payload).await?;
+                assert_eq!(&received_payload, payload);
+            }
+            IncomingOutcome::Plaintext { .. } => bail!("expected encrypted outcome"),
+        }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn fragmented_plaintext_prefix_is_replayed() -> Result<()> {
+        let info_hash = [0x23; 20];
+        let bytes = handshake(info_hash, [0x45; 20]);
+        let (client, server) = duplex(256);
+        let (server_read, server_write) = tokio::io::split(server);
+        let sender = async move {
+            let mut client = client;
+            for byte in bytes {
+                client.write_all(&[byte]).await?;
+                tokio::task::yield_now().await;
+            }
+            Ok::<_, std::io::Error>(())
+        };
+        let receiver = async move {
+            let outcome = incoming(server_read, server_write, |_| None).await?;
+            let mut read = match outcome {
+                IncomingOutcome::Plaintext { read, .. } => read,
+                IncomingOutcome::Encrypted { .. } => bail!("unexpected encrypted outcome"),
+            };
+            let mut replayed = [0u8; 68];
+            read.read_exact(&mut replayed).await?;
+            assert_eq!(replayed, bytes);
+            Ok::<_, anyhow::Error>(())
+        };
+        let (sent, received) = tokio::join!(sender, receiver);
+        sent?;
+        received?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn plaintext_first_response_triggers_immediate_fallback() -> Result<()> {
+        // A plaintext peer answers our Ya + PadA with its 68-byte BT handshake
+        // immediately. `outgoing` must detect the `\x13BitTorrent protocol`
+        // prefix and return `PlaintextPeer` well within the 10s read timeout
+        // (2s sniff window is the ceiling here).
+        let info_hash = [0x42; 20];
+        let (client, server) = duplex(8192);
+        let (client_read, client_write) = tokio::io::split(client);
+        let (mut server_read, mut server_write) = tokio::io::split(server);
+        let responder = async move {
+            // Read and discard Ya + PadA.
+            let mut discard = [0u8; 96];
+            server_read.read_exact(&mut discard).await?;
+            // Reply with a plaintext BT handshake.
+            server_write
+                .write_all(&handshake(info_hash, [0x55; 20]))
+                .await?;
+            Ok::<_, std::io::Error>(())
+        };
+
+        let initial = handshake(info_hash, [0x11; 20]);
+        let initiator = async {
+            let started = std::time::Instant::now();
+            let outcome = outgoing(client_read, client_write, &info_hash, &initial).await?;
+            let elapsed = started.elapsed();
+            match outcome {
+                OutgoingOutcome::PlaintextPeer => {
+                    assert!(
+                        elapsed < PLAINTEXT_SNIFF_TIMEOUT + Duration::from_millis(500),
+                        "plaintext fallback took {elapsed:?}, expected <= {PLAINTEXT_SNIFF_TIMEOUT:?}"
+                    );
+                    Ok::<_, anyhow::Error>(())
+                }
+                OutgoingOutcome::Encrypted(..) => bail!("expected plaintext peer fallback"),
+            }
+        };
+
+        let (init, resp) = tokio::join!(initiator, responder);
+        init?;
+        resp?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn mse_responder_still_works_after_sniff() -> Result<()> {
+        // The sniff reads the first 20 bytes; an MSE responder's public key
+        // must still arrive intact when it does not match the BT prefix.
+        let info_hash = [0x42; 20];
+        let initial = handshake(info_hash, [0x11; 20]);
+        let (client, server) = duplex(8192);
+        let (client_read, client_write) = tokio::io::split(client);
+        let (server_read, server_write) = tokio::io::split(server);
+
+        let initiator = outgoing(client_read, client_write, &info_hash, &initial);
+        let responder = incoming(server_read, server_write, |candidate| {
+            (candidate == &sha1(&[b"req2", &info_hash])).then_some(info_hash)
+        });
+        let (initiator_result, responder_result) = tokio::join!(initiator, responder);
+        let (mut client_read, mut client_write) = match initiator_result? {
+            OutgoingOutcome::Encrypted(r, w) => (r, w),
+            OutgoingOutcome::PlaintextPeer => bail!("unexpected plaintext peer"),
+        };
+        let (mut server_read, mut server_write, received) = match responder_result? {
+            IncomingOutcome::Encrypted {
+                read,
+                write,
+                handshake_bytes,
+                ..
+            } => (read, write, handshake_bytes),
+            IncomingOutcome::Plaintext { .. } => bail!("unexpected plaintext outcome"),
+        };
+        assert_eq!(received, initial);
+        client_write.write_all(b"ping").await?;
+        let mut buf = [0u8; 4];
+        server_read.read_exact(&mut buf).await?;
+        assert_eq!(&buf, b"ping");
+        server_write.write_all(b"pong").await?;
+        client_read.read_exact(&mut buf).await?;
+        assert_eq!(&buf, b"pong");
+        Ok(())
+    }
+}

@@ -1,77 +1,151 @@
 //! 768-bit Diffie-Hellman key exchange for BitTorrent MSE.
 //!
-//! The MSE spec fixes a 768-bit MODP group (prime + generator 2) that is not
-//! one of the standard groups shipped by crypto libraries (OpenSSL etc.), so
-//! the group parameters are hardcoded here (matching libtorrent/transmission/
-//! aria2, which do the same) and the modular exponentiation is delegated to
-//! `crypto-bigint` (pure Rust, no C dependency, works with rqbit's `rust-tls`
-//! build). The private exponent is 160 bits, matching common MSE peers.
-//!
-//! Note: `FixedMontyParams::new_vartime` is not constant-time. This is
-//! acceptable here because the private exponent is a fresh ephemeral session
-//! key generated per connection (not a long-lived secret); libtorrent's
-//! non-openssl path uses boost `cpp_int::powm` (also variable-time) for the
-//! same reason.
+//! This module uses fixed-size, little-endian limbs and has no big-integer
+//! dependency. The private exponent is 160 bits, matching common MSE peers.
 
-use crypto_bigint::{
-    Odd, Uint,
-    modular::{FixedMontyForm, FixedMontyParams},
-};
 use rand::Rng;
 
-/// 768-bit modulus: 12 limbs of 64 bits.
-type U768 = Uint<12>;
+type U768 = [u64; 12];
+type U1536 = [u64; 24];
 
-/// MSE-specified prime (RFC 2409-style 768-bit group, same hex as libtorrent
-/// `pe_crypto.cpp` / transmission `peer-mse.cc` / aria2 `MSEHandshake.cc`).
-const DH_PRIME_HEX: &str = concat!(
-    "FFFFFFFFFFFFFFFFC90FDAA22168C234C4C6628B80DC1CD1",
-    "29024E088A67CC74020BBEA63B139B22514A08798E3404DD",
-    "EF9519B3CD3A431B302B0A6DF25F14374FE1356D6D51C245",
-    "E485B576625E7EC6F44C42E9A63A36210000000000090563"
-);
+const DH_PRIME: U768 = [
+    0x0000000000090563,
+    0xF44C42E9A63A3621,
+    0xE485B576625E7EC6,
+    0x4FE1356D6D51C245,
+    0x302B0A6DF25F1437,
+    0xEF9519B3CD3A431B,
+    0x514A08798E3404DD,
+    0x020BBEA63B139B22,
+    0x29024E088A67CC74,
+    0xC4C6628B80DC1CD1,
+    0xC90FDAA22168C234,
+    0xFFFFFFFFFFFFFFFF,
+];
+
+const ONE: U768 = {
+    let mut value = [0u64; 12];
+    value[0] = 1;
+    value
+};
 
 const TWO: U768 = {
     let mut value = [0u64; 12];
     value[0] = 2;
-    U768::from_words(value)
+    value
 };
 
-fn prime() -> U768 {
-    U768::from_be_hex(DH_PRIME_HEX)
+fn bytes_be_to_limbs(bytes: &[u8; 96]) -> U768 {
+    let mut limbs = [0u64; 12];
+    for (i, limb) in limbs.iter_mut().enumerate() {
+        let start = 96 - 8 * (i + 1);
+        let mut be = [0u8; 8];
+        be.copy_from_slice(&bytes[start..start + 8]);
+        *limb = u64::from_be_bytes(be);
+    }
+    limbs
 }
 
-fn bytes_to_u768(bytes: &[u8; 96]) -> U768 {
-    U768::from_be_slice(bytes)
+fn limbs_to_bytes_be(limbs: &U768) -> [u8; 96] {
+    let mut bytes = [0u8; 96];
+    for (i, limb) in limbs.iter().enumerate() {
+        let start = 96 - 8 * (i + 1);
+        bytes[start..start + 8].copy_from_slice(&limb.to_be_bytes());
+    }
+    bytes
 }
 
-fn u768_to_bytes(value: &U768) -> [u8; 96] {
-    let encoded: [u8; 96] = value.to_be_bytes().into();
-    encoded
+fn ge(a: &U768, b: &U768) -> bool {
+    for i in (0..12).rev() {
+        if a[i] != b[i] {
+            return a[i] > b[i];
+        }
+    }
+    true
 }
 
-fn powm(base: &U768, exponent: &[u8; 20]) -> U768 {
-    let exp = secret_to_u768(exponent);
-    powm_u(base, &exp)
+fn sub(a: &U768, b: &U768) -> (U768, bool) {
+    let mut diff = [0u64; 12];
+    let mut borrow = false;
+    for i in 0..12 {
+        let (first, borrow_first) = a[i].overflowing_sub(b[i]);
+        let (second, borrow_second) = first.overflowing_sub(u64::from(borrow));
+        diff[i] = second;
+        borrow = borrow_first || borrow_second;
+    }
+    (diff, borrow)
 }
 
-fn secret_to_u768(secret: &[u8; 20]) -> U768 {
-    U768::from_be_slice_truncated(secret, 160)
+fn mul(a: &U768, b: &U768) -> U1536 {
+    let mut out = [0u64; 24];
+    for i in 0..12 {
+        let mut carry = 0u128;
+        for j in 0..12 {
+            let index = i + j;
+            let value = out[index] as u128 + (a[i] as u128) * (b[j] as u128) + carry;
+            out[index] = value as u64;
+            carry = value >> 64;
+        }
+        let mut index = i + 12;
+        while carry != 0 && index < out.len() {
+            let value = out[index] as u128 + carry;
+            out[index] = value as u64;
+            carry = value >> 64;
+            index += 1;
+        }
+    }
+    out
 }
 
-fn powm_u(base: &U768, exponent: &U768) -> U768 {
-    let p_odd: Odd<U768> = Odd::new(prime()).expect("MSE prime is odd");
-    // Variable-time Montgomery params: the private exponent is a fresh
-    // per-connection ephemeral key (not a long-lived secret), so constant-time
-    // is not required here; see the module note.
-    let params = FixedMontyParams::new_vartime(p_odd);
-    let monty_base = FixedMontyForm::new(base, &params);
-    monty_base.pow(exponent).retrieve()
+/// Reduce a 1536-bit value while retaining the carry bit of the 769-bit
+/// intermediate remainder. When the low-limb subtraction borrows, that borrow
+/// is paid by the retained high bit instead of being treated as an error.
+fn mod_reduce(value: &U1536, modulus: &U768) -> U768 {
+    let mut remainder = [0u64; 12];
+    let mut high = false;
+
+    for bit in (0..1536).rev() {
+        debug_assert!(!high);
+        high = remainder[11] >> 63 != 0;
+        let mut carry = 0u64;
+        for limb in &mut remainder {
+            let next_carry = *limb >> 63;
+            *limb = (*limb << 1) | carry;
+            carry = next_carry;
+        }
+        remainder[0] |= (value[bit / 64] >> (bit % 64)) & 1;
+
+        if high || ge(&remainder, modulus) {
+            let (difference, borrow) = sub(&remainder, modulus);
+            remainder = difference;
+            if high {
+                high = !borrow;
+            } else {
+                debug_assert!(!borrow);
+            }
+        }
+        debug_assert!(!high);
+    }
+
+    remainder
+}
+
+fn powm(base: &U768, exponent: &[u8; 20], modulus: &U768) -> U768 {
+    let mut result = ONE;
+    for byte in exponent {
+        for bit in (0..8).rev() {
+            result = mod_reduce(&mul(&result, &result), modulus);
+            if (byte >> bit) & 1 != 0 {
+                result = mod_reduce(&mul(&result, base), modulus);
+            }
+        }
+    }
+    result
 }
 
 pub struct Dh768 {
     secret: [u8; 20],
-    public: [u8; 96],
+    public: U768,
 }
 
 impl Dh768 {
@@ -84,29 +158,24 @@ impl Dh768 {
     }
 
     pub(super) fn from_secret(secret: [u8; 20]) -> Self {
-        let public = powm(&TWO, &secret);
-        Self {
-            secret,
-            public: u768_to_bytes(&public),
-        }
+        let public = powm(&TWO, &secret, &DH_PRIME);
+        Self { secret, public }
     }
 
     pub fn public_key_bytes(&self) -> [u8; 96] {
-        self.public
+        limbs_to_bytes_be(&self.public)
     }
 
     pub fn shared_secret(&self, remote: &[u8; 96]) -> Option<[u8; 96]> {
-        let remote = bytes_to_u768(remote);
-        // Reject degenerate keys (0, 1, or >= p-1), matching the old hand-rolled
-        // bounds check.
-        let two = U768::from(2u64);
-        let p = prime();
-        let p_minus_one = p.wrapping_sub(&U768::ONE);
-        if remote < two || remote >= p_minus_one {
+        let remote = bytes_be_to_limbs(remote);
+        if !ge(&remote, &TWO) {
             return None;
         }
-        let secret_u = secret_to_u768(&self.secret);
-        Some(u768_to_bytes(&powm_u(&remote, &secret_u)))
+        let prime_minus_one = sub(&DH_PRIME, &ONE).0;
+        if ge(&remote, &prime_minus_one) {
+            return None;
+        }
+        Some(limbs_to_bytes_be(&powm(&remote, &self.secret, &DH_PRIME)))
     }
 }
 
@@ -162,5 +231,19 @@ mod tests {
         let mut one = [0u8; 96];
         one[95] = 1;
         assert!(dh.shared_secret(&one).is_none());
+    }
+
+    #[test]
+    fn reduction_handles_769_bit_borrow() {
+        let mut twice_prime = [0u64; 24];
+        twice_prime[..12].copy_from_slice(&DH_PRIME);
+        let mut carry = 0u64;
+        for limb in &mut twice_prime[..12] {
+            let next = *limb >> 63;
+            *limb = (*limb << 1) | carry;
+            carry = next;
+        }
+        twice_prime[12] = carry;
+        assert_eq!(mod_reduce(&twice_prime, &DH_PRIME), [0u64; 12]);
     }
 }

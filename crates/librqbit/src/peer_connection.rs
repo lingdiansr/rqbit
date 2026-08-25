@@ -26,7 +26,7 @@ use peer_binary_protocol::{
 use serde::{Deserialize, Serialize};
 use serde_with::serde_as;
 use tokio::time::timeout;
-use tracing::{Instrument, debug, trace, trace_span};
+use tracing::{Instrument, debug, info, trace, trace_span, warn};
 
 use crate::{
     read_buf::ReadBuf,
@@ -81,8 +81,19 @@ pub struct PeerConnectionOptions {
     pub keep_alive_interval: Option<Duration>,
 
     /// How MSE (Message Stream Encryption) is applied to this peer connection.
-    /// Defaults to [`MseMode::Disabled`].
-    pub mse_mode: MseMode,
+    /// Defaults to [`MseMode::Enabled`].
+    pub mse_mode: crate::mse::MseMode,
+
+    /// Handshake timeout (BT handshake + MSE exchange), independent of
+    /// `read_write_timeout` used for regular messages. `None` falls back to
+    /// `read_write_timeout`. Defaults to the upstream behavior (no separate
+    /// handshake timeout).
+    #[serde_as(as = "Option<serde_with::DurationSeconds>")]
+    pub handshake_timeout: Option<Duration>,
+
+    /// Cap on outgoing connection attempts per second. `None` disables the
+    /// rate limit (upstream behavior).
+    pub connect_rate: Option<u32>,
 }
 
 pub(crate) struct PeerConnection<H> {
@@ -124,6 +135,105 @@ struct ManagePeerArgs {
     write: BoxAsyncWrite,
     outgoing_chan: tokio::sync::mpsc::UnboundedReceiver<WriterRequest>,
     have_broadcast: tokio::sync::broadcast::Receiver<ValidPieceIndex>,
+}
+
+/// Attempt an MSE handshake on a fresh connection; on failure or plaintext
+/// detection, redial plaintext on a new stream (never reuse the MSE-polluted
+/// one). Returns the final streams and whether MSE was applied.
+///
+/// `initial_payload` is the complete 68-byte BT handshake, consumed as the MSE
+/// IA when MSE succeeds; when `mse_applied` is false the caller must still
+/// write it out as a plaintext handshake.
+async fn connect_with_mse_fallback(
+    connector: &StreamConnector,
+    addr: SocketAddr,
+    info_hash: &[u8; 20],
+    connect_timeout: Duration,
+    handshake_timeout: Duration,
+    initial_payload: &[u8; 68],
+    mse_mode: MseMode,
+) -> Result<(ConnectionKind, BoxAsyncReadVectored, BoxAsyncWrite, bool)> {
+    use crate::mse::OutgoingOutcome;
+    use crate::vectored_traits::AsyncReadVectoredIntoCompat;
+
+    let (ckind, read, write) =
+        with_timeout("connecting", connect_timeout, connector.connect(addr)).await?;
+
+    if mse_mode == MseMode::Disabled || !matches!(ckind, ConnectionKind::Tcp) {
+        debug!(
+            ?addr,
+            "MSE skipped (disabled or non-TCP), connecting plaintext"
+        );
+        return Ok((ckind, read, write, false));
+    }
+
+    let mse_outcome = match tokio::time::timeout(
+        handshake_timeout,
+        crate::mse::outgoing(read, write, info_hash, initial_payload),
+    )
+    .await
+    {
+        Ok(Ok(outcome)) => outcome,
+        Ok(Err(e)) => {
+            if mse_mode == MseMode::Forced {
+                warn!(
+                    ?addr,
+                    "MSE forced but handshake failed, dropping peer: {e:#}"
+                );
+                return Err(Error::MseForced(addr));
+            }
+            warn!(?addr, "MSE handshake failed, redialing plaintext: {e:#}");
+            let (nk, nr, nw) =
+                with_timeout("connecting", connect_timeout, connector.connect(addr)).await?;
+            return Ok((nk, nr, nw, false));
+        }
+        Err(_elapsed) => {
+            if mse_mode == MseMode::Forced {
+                warn!(?addr, "MSE forced but handshake timed out, dropping peer");
+                return Err(Error::MseForced(addr));
+            }
+            warn!(?addr, "MSE handshake timed out, redialing plaintext");
+            let (nk, nr, nw) =
+                with_timeout("connecting", connect_timeout, connector.connect(addr)).await?;
+            return Ok((nk, nr, nw, false));
+        }
+    };
+
+    match mse_outcome {
+        OutgoingOutcome::Encrypted(r, w) => {
+            info!(?addr, "MSE handshake succeeded, RC4 established");
+            Ok((ckind, Box::new(r.into_vectored_compat()), Box::new(w), true))
+        }
+        OutgoingOutcome::PlaintextPeer => {
+            // The peer answered with a plaintext BT handshake within the sniff
+            // window. In Forced mode we cannot downgrade.
+            if mse_mode == MseMode::Forced {
+                warn!(
+                    ?addr,
+                    "MSE forced but peer answered plaintext, dropping peer"
+                );
+                return Err(Error::MseForced(addr));
+            }
+            info!(?addr, "peer answered plaintext, redialing plaintext");
+            let (nk, nr, nw) =
+                with_timeout("connecting", connect_timeout, connector.connect(addr)).await?;
+            Ok((nk, nr, nw, false))
+        }
+    }
+}
+
+/// Configurable exponential backoff for dead peers. `None` at the session
+/// level uses the upstream defaults (min 10s, factor 6, max 3600s, total 24h).
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct PeerBackoffConfig {
+    /// Initial retry delay after a peer dies.
+    pub min_delay: Duration,
+    /// Exponential growth factor between retries.
+    pub factor: f32,
+    /// Upper bound on a single retry delay.
+    pub max_delay: Duration,
+    /// Total accumulated backoff before the peer is dropped from the pool.
+    pub total_delay: Option<Duration>,
 }
 
 impl<H: PeerConnectionHandler> PeerConnection<H> {
@@ -211,6 +321,7 @@ impl<H: PeerConnectionHandler> PeerConnection<H> {
         outgoing_chan: tokio::sync::mpsc::UnboundedReceiver<WriterRequest>,
         have_broadcast: tokio::sync::broadcast::Receiver<ValidPieceIndex>,
     ) -> Result<()> {
+        use tokio::io::AsyncWriteExt;
         let rwtimeout = self
             .options
             .read_write_timeout
@@ -221,26 +332,51 @@ impl<H: PeerConnectionHandler> PeerConnection<H> {
             .connect_timeout
             .unwrap_or_else(|| Duration::from_secs(10));
 
+        // Separate handshake timeout (BT handshake + MSE exchange); falls back
+        // to read_write_timeout when unset (upstream behavior).
+        let handshake_timeout = self.options.handshake_timeout.unwrap_or(rwtimeout);
+
         let now = Instant::now();
-        let conn = self
-            .connector
-            .connect_with_handshake(
-                self.addr,
-                &self.info_hash.0,
-                &self.peer_id.0,
-                connect_timeout,
-                rwtimeout,
-                self.options.mse_mode,
-            )
-            .await?;
-        let (ckind, mut read, write) = (conn.kind, conn.read, conn.write);
+        // Serialize our BT handshake once; it doubles as the MSE initial
+        // payload (IA) and as the plaintext handshake.
+        let mut write_buf = Box::new([0u8; MAX_MSG_LEN]);
+        let handshake = Handshake::new(self.info_hash, self.peer_id);
+        let hsz = handshake.serialize_unchecked_len(&mut *write_buf);
+        let (ckind, mut read, mut write, mse_applied) = connect_with_mse_fallback(
+            &self.connector,
+            self.addr,
+            &self.info_hash.0,
+            connect_timeout,
+            handshake_timeout,
+            &write_buf[..hsz].try_into().map_err(|_| {
+                Error::Anyhow(anyhow::anyhow!(
+                    "serialized BT handshake has invalid length"
+                ))
+            })?,
+            self.options.mse_mode,
+        )
+        .await?;
 
         async move {
             self.handler.on_connected(now.elapsed());
-            let write_buf = Box::new([0u8; MAX_MSG_LEN]);
+
+            // When MSE succeeded it already consumed the handshake as IA.
+            // Otherwise (plaintext, MSE disabled, or non-TCP) write it now.
+            if !mse_applied {
+                with_timeout(
+                    "writing",
+                    rwtimeout,
+                    write
+                        .write_all(&write_buf[..hsz])
+                        .map_err(Error::WriteHandshake),
+                )
+                .await?;
+            }
 
             let mut read_buf = ReadBuf::new();
-            let h = read_buf.read_handshake(&mut read, rwtimeout).await?;
+            let h = read_buf
+                .read_handshake(&mut read, handshake_timeout)
+                .await?;
             let handshake_supports_extended = h.supports_extended();
             trace!(
                 peer_id=?h.peer_id,
@@ -513,11 +649,12 @@ impl<H: PeerConnectionHandler> PeerConnection<H> {
         }
     }
 }
+
 #[cfg(test)]
 mod mse_fallback_tests {
     use super::*;
     use crate::vectored_traits::AsyncReadVectoredIntoCompat;
-    use tokio::io::{AsyncReadExt, duplex};
+    use tokio::io::{AsyncReadExt, AsyncWriteExt, duplex};
 
     #[tokio::test]
     async fn fresh_redial_fallback_uses_a_new_stream() -> anyhow::Result<()> {
@@ -535,35 +672,33 @@ mod mse_fallback_tests {
                 Box::new(second_write),
             ),
         ]);
+        let initial = [0x5au8; 68];
         let peer = async move {
             // First connection: read Ya (96 bytes) then drop, so MSE fails.
             let mut first_attempt = [0u8; 96];
             first_peer.read_exact(&mut first_attempt).await?;
             drop(first_peer);
-            // Second connection: expect the plaintext BT handshake that
-            // connect_with_handshake wrote on the redial.
+            // Second connection: expect a plaintext BT handshake.
             let mut plaintext = [0u8; 68];
             second_peer.read_exact(&mut plaintext).await?;
-            assert_eq!(&plaintext[..20], b"\x13BitTorrent protocol");
-            assert_eq!(&plaintext[28..48], &[0x42; 20]);
-            assert_eq!(&plaintext[48..], &[0x11; 20]);
+            assert_eq!(plaintext, initial);
             Ok::<_, std::io::Error>(())
         };
         let client = async {
-            let conn = connector
-                .connect_with_handshake(
-                    "127.0.0.1:1".parse()?,
-                    &[0x42; 20],
-                    &[0x11; 20],
-                    Duration::from_secs(1),
-                    Duration::from_secs(1),
-                    MseMode::Enabled,
-                )
-                .await?;
-            assert!(!conn.mse_applied, "MSE should have failed and fallen back");
-            // connect_with_handshake already wrote the plaintext handshake on
-            // the redial; drain so the peer's read completes.
-            drop(conn.read);
+            let (_ckind, read, mut write, mse_applied) = connect_with_mse_fallback(
+                &connector,
+                "127.0.0.1:1".parse()?,
+                &[0x42; 20],
+                Duration::from_secs(1),
+                Duration::from_secs(1),
+                &initial,
+                MseMode::Enabled,
+            )
+            .await?;
+            assert!(!mse_applied, "MSE should have failed and fallen back");
+            write.write_all(&initial).await?;
+            // Drain so the peer's read completes; not strictly required.
+            drop(read);
             assert_eq!(connector.remaining_test_connections()?, 0);
             Ok::<_, anyhow::Error>(())
         };
@@ -581,30 +716,30 @@ mod mse_fallback_tests {
             Box::new(read.into_vectored_compat()),
             Box::new(write),
         )]);
+        let initial = [0x5au8; 68];
         let peer = async move {
             // Disabled MSE: the peer must receive the plaintext handshake
             // directly (68 bytes), never Ya + PadA (96+ bytes first).
             let mut plaintext = [0u8; 68];
             peer.read_exact(&mut plaintext).await?;
-            assert_eq!(&plaintext[..20], b"\x13BitTorrent protocol");
-            assert_eq!(&plaintext[28..48], &[0x42; 20]);
-            assert_eq!(&plaintext[48..], &[0x11; 20]);
+            assert_eq!(plaintext, initial);
             Ok::<_, std::io::Error>(())
         };
         let client = async {
-            let conn = connector
-                .connect_with_handshake(
-                    "127.0.0.1:1".parse()?,
-                    &[0x42; 20],
-                    &[0x11; 20],
-                    Duration::from_secs(1),
-                    Duration::from_secs(1),
-                    MseMode::Disabled,
-                )
-                .await?;
-            assert!(!conn.mse_applied, "MSE must not be attempted in Disabled mode");
-            // connect_with_handshake wrote the plaintext handshake already.
-            drop(conn.read);
+            let (_ckind, read, mut write, mse_applied) = connect_with_mse_fallback(
+                &connector,
+                "127.0.0.1:1".parse()?,
+                &[0x42; 20],
+                Duration::from_secs(1),
+                Duration::from_secs(1),
+                &initial,
+                MseMode::Disabled,
+            )
+            .await?;
+            assert!(!mse_applied, "MSE must not be attempted in Disabled mode");
+            // mse_applied=false: the caller writes the plaintext handshake.
+            write.write_all(&initial).await?;
+            drop(read);
             // Only one connection consumed: mse::outgoing was never invoked.
             assert_eq!(connector.remaining_test_connections()?, 0);
             Ok::<_, anyhow::Error>(())
@@ -631,18 +766,18 @@ mod mse_fallback_tests {
             Ok::<_, std::io::Error>(())
         };
         let client = async {
-            let result = connector
-                .connect_with_handshake(
-                    "127.0.0.1:1".parse()?,
-                    &[0x42; 20],
-                    &[0x11; 20],
-                    Duration::from_secs(1),
-                    Duration::from_secs(1),
-                    MseMode::Forced,
-                )
-                .await;
+            let result = connect_with_mse_fallback(
+                &connector,
+                "127.0.0.1:1".parse()?,
+                &[0x42; 20],
+                Duration::from_secs(1),
+                Duration::from_secs(1),
+                &[0x5a; 68],
+                MseMode::Forced,
+            )
+            .await;
             assert!(
-                matches!(result, Err(Error::MseForced)),
+                matches!(result, Err(Error::MseForced(_))),
                 "Forced mode must error on MSE failure"
             );
             // No redial in Forced mode: exactly one connection was consumed.

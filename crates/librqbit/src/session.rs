@@ -23,7 +23,7 @@ use crate::{
     limits::{Limits, LimitsConfig},
     listen::{Accept, ListenerOptions},
     merge_streams::merge_streams,
-    mse::MseMode,
+    mse::{IncomingOutcome, MseMode},
     peer_connection::PeerConnectionOptions,
     read_buf::ReadBuf,
     session_persistence::{SessionPersistenceStore, json::JsonSessionPersistenceStore},
@@ -33,14 +33,14 @@ use crate::{
         BoxStorageFactory, StorageFactoryExt, TorrentStorage, filesystem::FilesystemStorageFactory,
     },
     stream_connect::{
-        ConnectionKind, ConnectionOptions, IncomingHandshake, SocksProxyConfig, StreamConnector,
-        StreamConnectorArgs,
+        ConnectionKind, ConnectionOptions, SocksProxyConfig, StreamConnector, StreamConnectorArgs,
     },
     torrent_state::{
         ManagedTorrentHandle, ManagedTorrentLocked, ManagedTorrentOptions, ManagedTorrentState,
         TorrentMetadata, TorrentStateLive, initializing::TorrentStateInitializing,
     },
     type_aliases::{BoxAsyncReadVectored, BoxAsyncWrite, PeerStream},
+    vectored_traits::AsyncReadVectoredIntoCompat,
 };
 use anyhow::{Context, bail};
 use arc_swap::ArcSwapOption;
@@ -70,6 +70,7 @@ use parking_lot::RwLock;
 use peer_binary_protocol::Handshake;
 use serde::{Deserialize, Serialize};
 use sha1w::{ISha1, Sha1};
+use tokio::io::AsyncReadExt;
 use tokio::sync::Notify;
 use tokio_util::sync::{CancellationToken, DropGuard};
 use tracing::{Instrument, debug, debug_span, error, info, trace, warn};
@@ -155,6 +156,7 @@ pub struct Session {
     pub peer_limit: Option<usize>,
     client_name_and_version: String,
     mse_mode: MseMode,
+    peer_backoff: Option<crate::PeerBackoffConfig>,
 }
 
 async fn torrent_from_url(
@@ -485,8 +487,12 @@ pub struct SessionOptions {
     pub client_name_and_version: Option<String>,
 
     /// How MSE (Message Stream Encryption) is applied to peer connections.
-    /// Defaults to [`MseMode::Disabled`].
+    /// Defaults to [`MseMode::Enabled`].
     pub mse_mode: MseMode,
+
+    /// Backoff config for dead outgoing peers. `None` uses the upstream
+    /// defaults (min 10s, factor 6, max 3600s, total 24h).
+    pub peer_backoff: Option<crate::PeerBackoffConfig>,
 }
 
 impl Default for SessionOptions {
@@ -516,6 +522,7 @@ impl Default for SessionOptions {
             ipv4_only: false,
             client_name_and_version: None,
             mse_mode: MseMode::default(),
+            peer_backoff: None,
         }
     }
 }
@@ -820,6 +827,7 @@ impl Session {
                 peer_limit: opts.peer_limit,
                 client_name_and_version,
                 mse_mode: opts.mse_mode,
+                peer_backoff: opts.peer_backoff,
 
                 #[cfg(feature = "disable-upload")]
                 _disable_upload: opts.disable_upload,
@@ -926,6 +934,9 @@ impl Session {
             .peer_opts
             .read_write_timeout
             .unwrap_or_else(|| Duration::from_secs(10));
+        // Separate handshake timeout for the inbound BT/MSE handshake; falls
+        // back to read_write_timeout when unset (upstream behavior).
+        let handshake_timeout = self.peer_opts.handshake_timeout.unwrap_or(rwtimeout);
 
         let incoming_ip = addr.ip();
         if self.blocklist.has(incoming_ip) {
@@ -941,6 +952,19 @@ impl Session {
                 .blocked_incoming
                 .fetch_add(1, Ordering::Relaxed);
             bail!("Incoming ip {incoming_ip} is not in allowlist");
+        }
+
+        if self.mse_mode == MseMode::Disabled {
+            debug!(?addr, "MSE disabled, skipping MSE incoming handshake");
+            let mut read_buf = ReadBuf::new();
+            let mut reader = reader;
+            let h = read_buf
+                .read_handshake(&mut reader, handshake_timeout)
+                .await
+                .context("error reading handshake")?;
+            return self
+                .finish_incoming_connection(addr, kind, h, reader, writer, read_buf)
+                .await;
         }
 
         // Snapshot the (SKEY hash -> info_hash) mapping for every known torrent
@@ -966,33 +990,75 @@ impl Session {
                 .map(|(_, info_hash)| *info_hash)
         };
 
-        let incoming = crate::stream_connect::accept_with_handshake(
-            addr,
-            reader,
-            writer,
-            rwtimeout,
-            self.mse_mode,
-            lookup,
-        )
-        .await?;
+        let incoming = crate::mse::incoming(reader, writer, lookup);
+        let incoming = tokio::time::timeout(handshake_timeout, incoming)
+            .await
+            .context("MSE incoming handshake timed out")??;
 
-        self.finish_incoming_connection(addr, kind, incoming).await
+        match incoming {
+            IncomingOutcome::Encrypted {
+                read,
+                write,
+                handshake_bytes,
+                info_hash,
+            } => {
+                let (h, _size) = Handshake::deserialize(&handshake_bytes[..])
+                    .map_err(|e| anyhow::anyhow!("error deserializing MSE handshake: {e:?}"))?;
+                if h.info_hash.0 != info_hash {
+                    bail!("MSE handshake info hash does not match SKEY");
+                }
+                self.finish_incoming_connection(
+                    addr,
+                    kind,
+                    h,
+                    Box::new(read.into_vectored_compat()),
+                    Box::new(write),
+                    ReadBuf::new(),
+                )
+                .await
+            }
+            IncomingOutcome::Plaintext { read, write } => {
+                if self.mse_mode == MseMode::Forced {
+                    warn!(?addr, "MSE forced, rejecting plaintext connection");
+                    bail!("MSE is forced, rejecting plaintext connection from {addr}");
+                }
+                // 9.0's `ReadBuf::read_handshake` performs a single `read()`
+                // before deserializing; a `PrefixReader` replaying the 20
+                // consumed prefix bytes would satisfy it with only those bytes.
+                // Read the full 68-byte handshake ourselves (read_exact loops),
+                // mirroring the Encrypted branch.
+                let mut handshake_bytes = [0u8; 68];
+                let mut read = read;
+                tokio::time::timeout(handshake_timeout, read.read_exact(&mut handshake_bytes))
+                    .await
+                    .context("plaintext handshake read timed out")?
+                    .context("error reading fragmented plaintext handshake")?;
+                let (h, _size) = Handshake::deserialize(&handshake_bytes[..]).map_err(|e| {
+                    anyhow::anyhow!("error deserializing plaintext handshake: {e:?}")
+                })?;
+                self.finish_incoming_connection(
+                    addr,
+                    kind,
+                    h,
+                    Box::new(read.into_vectored_compat()),
+                    Box::new(write),
+                    ReadBuf::new(),
+                )
+                .await
+            }
+        }
     }
 
     async fn finish_incoming_connection(
         self: Arc<Self>,
         addr: SocketAddr,
         kind: ConnectionKind,
-        incoming: IncomingHandshake,
+        h: Handshake,
+        reader: BoxAsyncReadVectored,
+        writer: BoxAsyncWrite,
+        read_buf: ReadBuf,
     ) -> anyhow::Result<(Arc<TorrentStateLive>, CheckedIncomingConnection)> {
-        let IncomingHandshake {
-            handshake: h,
-            read: reader,
-            write: writer,
-            read_buf,
-            encrypted,
-        } = incoming;
-        trace!("received handshake from {addr}: {:?} (encrypted={encrypted})", h);
+        trace!("received handshake from {addr}: {:?}", h);
 
         if h.peer_id == self.peer_id {
             bail!("seems like we are connecting to ourselves, ignoring");
@@ -1096,6 +1162,8 @@ impl Session {
                 .keep_alive_interval
                 .or(self.peer_opts.keep_alive_interval),
             mse_mode: self.mse_mode,
+            handshake_timeout: other.handshake_timeout.or(self.peer_opts.handshake_timeout),
+            connect_rate: other.connect_rate.or(self.peer_opts.connect_rate),
         }
     }
 
@@ -1412,6 +1480,8 @@ impl Session {
                     peer_connect_timeout: peer_opts.connect_timeout,
                     peer_read_write_timeout: peer_opts.read_write_timeout,
                     mse_mode: self.mse_mode,
+                    connect_rate: peer_opts.connect_rate,
+                    peer_backoff: self.peer_backoff.clone(),
                     allow_overwrite: opts.overwrite,
                     output_folder,
                     ratelimits: opts.ratelimits,
