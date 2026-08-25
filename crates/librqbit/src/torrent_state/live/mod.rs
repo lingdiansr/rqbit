@@ -45,7 +45,7 @@ pub mod stats;
 
 use std::{
     borrow::Cow,
-    collections::HashSet,
+    collections::{HashMap, HashSet},
     net::{IpAddr, SocketAddr},
     num::NonZeroU32,
     sync::{
@@ -81,7 +81,7 @@ use tokio::sync::{
     mpsc::{UnboundedReceiver, UnboundedSender, unbounded_channel},
 };
 use tokio_util::sync::CancellationToken;
-use tracing::{Instrument, debug, debug_span, error, info, trace, warn};
+use tracing::{Instrument, debug, debug_span, info, trace, warn};
 
 use crate::{
     Error,
@@ -214,6 +214,14 @@ pub struct TorrentStateLive {
         ChunkInfo,
     )>,
     ratelimits: Limits,
+
+    // Write-coalescing buffer: piece index -> buffered bytes not yet written
+    // to disk. Flushed when the piece completes or a size threshold is hit
+    // (aligned with libtorrent store_buffer).
+    pending_writes: Mutex<HashMap<ValidPieceIndex, Vec<u8>>>,
+    // Stats for the write cache.
+    pwrite_count: AtomicU64,
+    pwrite_bytes: AtomicU64,
 }
 
 impl TorrentStateLive {
@@ -297,6 +305,9 @@ impl TorrentStateLive {
                 .collect(),
             ratelimit_upload_tx,
             ratelimits,
+            pending_writes: Default::default(),
+            pwrite_count: AtomicU64::new(0),
+            pwrite_bytes: AtomicU64::new(0),
         });
 
         state.spawn(
@@ -891,6 +902,61 @@ impl TorrentStateLive {
         FileOps::new(&self.metadata.info, &*self.files, &self.metadata.file_infos)
     }
 
+    /// Buffer a received chunk for coalesced writes. The full piece buffer is
+    /// written once on completion instead of one pwrite per chunk.
+    pub(crate) fn buffer_chunk(&self, chunk_info: &ChunkInfo, data: (&[u8], &[u8])) {
+        let mut w = self.pending_writes.lock();
+        let piece_len = self.lengths.piece_length(chunk_info.piece_index) as usize;
+        let entry = w
+            .entry(chunk_info.piece_index)
+            .or_insert_with(|| vec![0u8; piece_len]);
+        let off = chunk_info.offset as usize;
+        let mut copied = 0usize;
+        for part in [data.0, data.1] {
+            entry[off + copied..off + copied + part.len()].copy_from_slice(part);
+            copied += part.len();
+        }
+    }
+
+    /// Flush a piece's buffered bytes to disk in one pass.
+    pub(crate) fn flush_piece(&self, piece: ValidPieceIndex) -> anyhow::Result<()> {
+        let data = self.pending_writes.lock().remove(&piece);
+        if let Some(data) = data {
+            self.file_ops().write_piece_buffer(piece, &data)?;
+            self.pwrite_count.fetch_add(1, Ordering::Relaxed);
+            self.pwrite_bytes
+                .fetch_add(data.len() as u64, Ordering::Relaxed);
+        }
+        Ok(())
+    }
+
+    /// If the total buffered bytes exceed the configured budget, flush the
+    /// oldest pieces to bound memory (like aria2 --disk-cache eviction).
+    #[allow(clippy::cast_possible_truncation)]
+    pub(crate) fn flush_over_budget(&self) -> anyhow::Result<()> {
+        let max = self
+            .shared
+            .options
+            .write_buffer_max_bytes
+            .unwrap_or(DEFAULT_WRITE_BUFFER_MAX_BYTES) as usize;
+        let total: usize = self.pending_writes.lock().values().map(|v| v.len()).sum();
+        if total <= max {
+            return Ok(());
+        }
+        let pieces: Vec<ValidPieceIndex> = self.pending_writes.lock().keys().copied().collect();
+        let mut over = total;
+        for p in pieces {
+            if over <= max {
+                break;
+            }
+            if let Some(d) = self.pending_writes.lock().remove(&p) {
+                over -= d.len();
+                self.file_ops().write_piece_buffer(p, &d)?;
+            }
+        }
+        Ok(())
+    }
+
     pub(crate) fn lock_read(
         &self,
         reason: &'static str,
@@ -1238,6 +1304,10 @@ const DEFAULT_ENDGAME_PIECE_THRESHOLD: usize = 20;
 
 /// Max peers downloading a single piece in end-game.
 const DEFAULT_ENDGAME_MAX_PEERS: usize = 2;
+
+/// Write-cache budget: when total buffered bytes exceed this, oldest pieces
+/// are flushed (aligned with aria2 --disk-cache, 16 MiB default).
+const DEFAULT_WRITE_BUFFER_MAX_BYTES: u64 = 16 * 1024 * 1024;
 
 /// How often the chunk request timeout checker runs.
 const CHUNK_TIMEOUT_CHECK_INTERVAL: Duration = Duration::from_secs(1);
@@ -2174,17 +2244,9 @@ impl PeerHandler {
             //
 
             if !cfg!(feature = "_disable_disk_write_net_benchmark") {
-                match state.file_ops().write_chunk(addr, piece, chunk_info) {
-                    Ok(()) => {}
-                    Err(e) => {
-                        error!(
-                            id = state.shared.id,
-                            info_hash = ?state.shared.info_hash,
-                            "FATAL: error writing chunk to disk: {e:#}"
-                        );
-                        return state.on_fatal_error(e);
-                    }
-                };
+                // Coalesce into the piece write buffer instead of one pwrite
+                // per chunk; flushed once on piece completion.
+                state.buffer_chunk(chunk_info, piece.data());
             }
 
             let full_piece_download_time = {
@@ -2213,14 +2275,24 @@ impl PeerHandler {
                 }
             };
 
-            // We don't care about per piece lock anymore, as it's removed from inflight pieces.
-            // It shouldn't impact perf anyway, but dropping just in case.
-            drop(ppl_guard);
-
             let full_piece_download_time = match full_piece_download_time {
                 Some(t) => t,
                 None => return Ok(()),
             };
+
+            // The piece is no longer in-flight; release the per-piece lock
+            // before the (relatively slow) disk flush + checksum.
+            drop(ppl_guard);
+
+            // Flush the completed piece to disk in one coalesced write, then
+            // checksum it (must read the flushed bytes). A disk write failure
+            // here is fatal.
+            if let Err(e) = state.flush_piece(chunk_info.piece_index) {
+                return state.on_fatal_error(e);
+            }
+            if let Err(e) = state.flush_over_budget() {
+                return state.on_fatal_error(e);
+            }
 
             match state
                 .file_ops()

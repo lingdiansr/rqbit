@@ -143,6 +143,9 @@ pub(crate) struct ManagedTorrentOptions {
     pub endgame_piece_threshold: Option<usize>,
     /// Max peers downloading a single piece in end-game. Defaults to 2.
     pub endgame_max_peers_per_piece: Option<usize>,
+    /// Write-cache budget in bytes; when exceeded, oldest buffered pieces are
+    /// flushed. Defaults to 16 MiB when None.
+    pub write_buffer_max_bytes: Option<u64>,
     pub allow_overwrite: bool,
     pub output_folder: PathBuf,
     pub ratelimits: LimitsConfig,

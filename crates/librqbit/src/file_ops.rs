@@ -307,6 +307,9 @@ impl<'a> FileOps<'a> {
         Ok(())
     }
 
+    // Kept for external callers; internal download path coalesces writes via
+    // `write_piece_buffer` instead.
+    #[allow(dead_code)]
     pub fn write_chunk(
         &self,
         who_sent: PeerHandle,
@@ -356,6 +359,62 @@ impl<'a> FileOps<'a> {
             }
 
             absolute_offset = 0;
+        }
+
+        Ok(())
+    }
+
+    /// Write a whole piece's buffered bytes to disk in one pass (used by the
+    /// write-coalescing cache when a piece completes). `data` holds the full
+    /// piece, written across any file boundary it spans.
+    #[allow(clippy::cast_possible_truncation)]
+    pub fn write_piece_buffer(
+        &self,
+        piece_index: ValidPieceIndex,
+        data: &[u8],
+    ) -> anyhow::Result<()> {
+        let mut absolute_offset = self.torrent.lengths().chunk_absolute_offset(&ChunkInfo {
+            piece_index,
+            chunk_index: 0,
+            absolute_index: 0,
+            size: data.len() as u32,
+            offset: 0,
+        });
+        let mut data_offset = 0usize;
+
+        for (file_idx, file_info) in self.file_infos.iter().enumerate() {
+            let file_len = file_info.len;
+            if absolute_offset > file_len {
+                absolute_offset -= file_len;
+                continue;
+            }
+
+            let remaining_len = file_len - absolute_offset;
+            #[allow(clippy::cast_possible_truncation)]
+            let to_write = std::cmp::min(data.len() - data_offset, remaining_len as usize);
+            if to_write == 0 {
+                break;
+            }
+            let slice = &data[data_offset..data_offset + to_write];
+            if !file_info.attrs.padding {
+                self.files
+                    .pwrite_all_vectored(
+                        file_idx,
+                        absolute_offset,
+                        [std::io::IoSlice::new(slice), std::io::IoSlice::new(&[])],
+                    )
+                    .with_context(|| {
+                        format!(
+                            "error writing piece {piece_index} to file {file_idx} (\"{:?}\")",
+                            file_info.relative_filename
+                        )
+                    })?;
+            }
+            data_offset += to_write;
+            absolute_offset = 0;
+            if data_offset >= data.len() {
+                break;
+            }
         }
 
         Ok(())

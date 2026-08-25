@@ -1516,6 +1516,7 @@ impl Session {
                     snub_duration_secs: None,
                     endgame_piece_threshold: None,
                     endgame_max_peers_per_piece: None,
+                    write_buffer_max_bytes: None,
                     allow_overwrite: opts.overwrite,
                     output_folder,
                     ratelimits: opts.ratelimits,
