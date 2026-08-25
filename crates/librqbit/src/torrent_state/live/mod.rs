@@ -529,6 +529,7 @@ impl TorrentStateLive {
         self: Arc<Self>,
         addr: SocketAddr,
         permit: OwnedSemaphorePermit,
+        global_permit: OwnedSemaphorePermit,
     ) -> crate::Result<()> {
         let state = self;
         let (rx, tx) = state.peers.mark_peer_connecting(addr)?;
@@ -597,6 +598,7 @@ impl TorrentStateLive {
             }
         }
         drop(permit);
+        drop(global_permit);
         Ok(())
     }
 
@@ -612,6 +614,14 @@ impl TorrentStateLive {
             .options
             .connect_rate
             .map(|n| Duration::from_micros(1_000_000 / u64::from(n.max(1))));
+        // Cold-start boost: the first N peers bypass `connect_interval` so the
+        // initial tracker/DHT batch connects immediately (aligned with
+        // libtorrent `torrent_connect_boost`).
+        let mut first_wave_remaining = state
+            .shared
+            .options
+            .first_wave_peers
+            .unwrap_or(DEFAULT_FIRST_WAVE_PEERS);
         loop {
             let addr = peer_queue_rx.recv().await.ok_or(Error::TorrentIsNotLive)?;
             if state.shared.options.disable_upload() && state.is_finished_and_no_active_streams() {
@@ -660,14 +670,29 @@ impl TorrentStateLive {
                 continue;
             }
 
+            // Acquire the global (session-wide) permit before the per-torrent
+            // one, so multiple torrents share the session's outgoing cap.
+            let global_permit = session
+                .global_peer_semaphore
+                .clone()
+                .acquire_owned()
+                .await?;
             let permit = state.peer_semaphore.clone().acquire_owned().await?;
             state.spawn(
                 debug_span!(parent: state.shared.span.clone(), "manage_peer", peer = ?addr),
                 format!("[{}][addr={addr}]manage_peer", state.shared.id),
-                aframe!(state.clone().task_manage_outgoing_peer(addr, permit)),
+                aframe!(
+                    state
+                        .clone()
+                        .task_manage_outgoing_peer(addr, permit, global_permit)
+                ),
             );
             if let Some(i) = connect_interval {
-                tokio::time::sleep(i).await;
+                if first_wave_remaining > 0 {
+                    first_wave_remaining -= 1;
+                } else {
+                    tokio::time::sleep(i).await;
+                }
             }
         }
     }
@@ -1006,6 +1031,14 @@ impl TorrentStateLive {
 }
 
 const DEFAULT_PEER_REQUEST_WINDOW: usize = 128;
+
+/// How many of the first peers bypass the `connect_rate` throttle for a
+/// cold-start boost (aligned with libtorrent `torrent_connect_boost`).
+const DEFAULT_FIRST_WAVE_PEERS: u32 = 30;
+
+/// Max bad pieces a peer may send before being disconnected (aligned with
+/// transmission `MaxBadPiecesPerPeer`).
+const DEFAULT_MAX_BAD_PIECES_PER_PEER: u32 = 5;
 
 struct PeerFlowControl {
     i_am_choked: bool,
@@ -1975,18 +2008,35 @@ impl PeerHandler {
                     state.transmit_haves(chunk_info.piece_index);
                 }
                 false => {
-                    warn!(
-                        id = state.shared.id,
-                        info_hash = ?state.shared.info_hash,
-                        ?addr,
-                        "checksum for piece={} did not validate. disconnecting peer.", index
-                    );
+                    // Accumulate bad pieces per peer; only disconnect once the
+                    // tolerance is exceeded (transmission MaxBadPiecesPerPeer).
+                    let bad_pieces = counters.bad_pieces.fetch_add(1, Ordering::Relaxed) + 1;
+                    let max_bad = state
+                        .shared
+                        .options
+                        .max_bad_pieces_per_peer
+                        .unwrap_or(DEFAULT_MAX_BAD_PIECES_PER_PEER);
                     state
                         .lock_write("mark_piece_broken")
                         .get_pieces_mut()?
                         .mark_piece_hash_failed(chunk_info.piece_index);
                     state.new_pieces_notify.notify_waiters();
-                    anyhow::bail!("i am probably a bogus peer. dying.")
+                    if bad_pieces > max_bad {
+                        warn!(
+                            id = state.shared.id,
+                            info_hash = ?state.shared.info_hash,
+                            ?addr,
+                            "peer sent too many bad pieces ({bad_pieces} > {max_bad}), disconnecting"
+                        );
+                        anyhow::bail!("i am probably a bogus peer. dying.")
+                    } else {
+                        warn!(
+                            id = state.shared.id,
+                            info_hash = ?state.shared.info_hash,
+                            ?addr,
+                            "checksum for piece={index} did not validate (bad_pieces={bad_pieces}/{max_bad}), requeueing"
+                        );
+                    }
                 }
             };
             Ok(())
