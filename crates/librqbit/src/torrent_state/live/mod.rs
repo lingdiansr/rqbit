@@ -1379,13 +1379,9 @@ impl PeerConnectionHandler for &'_ PeerHandler {
     }
 
     fn should_unchoke(&self) -> bool {
-        // We unchoke a peer only when the rechoke task has put it in a slot
-        // (am_choking == false). Defaults to choked on connect.
-        !self
-            .state
-            .peers
-            .with_live(self.addr, |live| live.am_choking)
-            .unwrap_or(true)
+        // Isolation test: always unchoke on connect (disable tit-for-tat
+        // choke), matching baseline behavior.
+        true
     }
 
     fn should_transmit_have(&self, id: ValidPieceIndex) -> bool {
