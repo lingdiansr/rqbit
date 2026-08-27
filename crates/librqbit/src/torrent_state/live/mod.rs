@@ -1234,7 +1234,7 @@ const DEFAULT_SNUB_DURATION_SECS: u64 = 60;
 
 /// Enter end-game mode (second peer joins an in-flight piece) when the
 /// remaining queued pieces are at most this.
-const DEFAULT_ENDGAME_PIECE_THRESHOLD: usize = 20;
+const DEFAULT_ENDGAME_PIECE_THRESHOLD: usize = 0;
 
 /// Max peers downloading a single piece in end-game.
 const DEFAULT_ENDGAME_MAX_PEERS: usize = 2;
