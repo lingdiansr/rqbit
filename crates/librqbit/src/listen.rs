@@ -62,8 +62,7 @@ pub struct ListenerOptions {
 impl Default for ListenerOptions {
     fn default() -> Self {
         Self {
-            // TODO: once uTP is stable upgrade default to both
-            mode: ListenerMode::TcpOnly,
+            mode: ListenerMode::TcpAndUtp,
             listen_addr: (Ipv6Addr::UNSPECIFIED, 0).into(),
             enable_upnp_port_forwarding: false,
             utp_opts: None,

@@ -168,12 +168,10 @@ struct Opts {
     #[arg(long = "disable-tcp-connect", env = "RQBIT_TCP_CONNECT_DISABLE")]
     disable_tcp_connect: bool,
 
-    /// Enable to listen and connect over uTP
-    #[arg(
-        long = "experimental-enable-utp-listen",
-        env = "RQBIT_EXPERIMENTAL_UTP_LISTEN_ENABLE"
-    )]
-    enable_utp_listen: bool,
+    /// Disable listening for incoming connections over uTP. Note that
+    /// listening over uTP is enabled by default (--disable-utp-listen to disable).
+    #[arg(long = "disable-utp-listen", env = "RQBIT_UTP_LISTEN_DISABLE")]
+    disable_utp_listen: bool,
 
     /// The port to listen for incoming connections (applies to both TCP and uTP).
     ///
@@ -608,10 +606,10 @@ async fn async_main(mut opts: Opts, cancel: CancellationToken) -> anyhow::Result
         Default::default()
     };
 
-    let listen_mode = match (!opts.disable_tcp_listen, opts.enable_utp_listen) {
+    let listen_mode = match (!opts.disable_tcp_listen, !opts.disable_utp_listen) {
+        (true, true) => Some(ListenerMode::TcpAndUtp),
         (true, false) => Some(ListenerMode::TcpOnly),
         (false, true) => Some(ListenerMode::UtpOnly),
-        (true, true) => Some(ListenerMode::TcpAndUtp),
         (false, false) => None,
     };
     let listen = listen_mode.map(|mode| ListenerOptions {
