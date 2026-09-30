@@ -88,6 +88,14 @@ enum SupportedTracker {
     Http(Url),
 }
 
+impl SupportedTracker {
+    fn url(&self) -> &Url {
+        match self {
+            SupportedTracker::Udp(url) | SupportedTracker::Http(url) => url,
+        }
+    }
+}
+
 impl std::fmt::Debug for SupportedTracker {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
@@ -183,9 +191,19 @@ impl TrackerComms {
                 reqwest_client,
                 key: rand::random(),
             });
+            // Each tracker is isolated behind `catch_unwind`: all trackers and
+            // (upstream of this stream) DHT/LSD peers are polled from the same
+            // task, so a panic inside one tracker's I/O stack (e.g. a TLS
+            // verifier that aborts instead of returning an error) would
+            // otherwise tear down peer discovery for the whole torrent.
             let mut futures = FuturesUnordered::new();
             for tracker in trackers {
-                futures.push(comms.add_tracker(tracker, &udp_client))
+                let url = tracker.url().clone();
+                futures.push(
+                    std::panic::AssertUnwindSafe(comms.add_tracker(tracker, &udp_client))
+                        .catch_unwind()
+                        .map(move |res| (url, res)),
+                );
             }
             while !(futures.is_empty()) {
                 tokio::select! {
@@ -195,8 +213,17 @@ impl TrackerComms {
                         }
                     }
                     e = futures.next(), if !futures.is_empty() => {
-                        if let Some(Err(e)) = e {
-                            debug!("error: {e}");
+                        match e {
+                            Some((url, Ok(Err(e)))) => debug!(tracker = %url, "error: {e:#}"),
+                            Some((url, Err(panic))) => {
+                                let msg = panic
+                                    .downcast_ref::<&str>()
+                                    .copied()
+                                    .or_else(|| panic.downcast_ref::<String>().map(String::as_str))
+                                    .unwrap_or("<non-string panic payload>");
+                                tracing::error!(tracker = %url, "tracker monitor panicked, disabling this tracker: {msg}");
+                            }
+                            _ => {}
                         }
                     }
                 }
