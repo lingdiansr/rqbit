@@ -1492,6 +1492,7 @@ impl Session {
                     force_tracker_interval: opts.force_tracker_interval,
                     peer_connect_timeout: peer_opts.connect_timeout,
                     peer_read_write_timeout: peer_opts.read_write_timeout,
+                    peer_handshake_timeout: peer_opts.handshake_timeout,
                     mse_mode: self.mse_mode,
                     connect_rate: peer_opts.connect_rate,
                     peer_backoff: self.peer_backoff.clone(),

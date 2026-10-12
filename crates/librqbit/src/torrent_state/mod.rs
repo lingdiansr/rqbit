@@ -112,6 +112,9 @@ pub(crate) struct ManagedTorrentOptions {
     pub force_tracker_interval: Option<Duration>,
     pub peer_connect_timeout: Option<Duration>,
     pub peer_read_write_timeout: Option<Duration>,
+    /// BT handshake + MSE exchange timeout for live-torrent peers; None falls
+    /// back to `peer_read_write_timeout`.
+    pub peer_handshake_timeout: Option<Duration>,
     pub mse_mode: crate::mse::MseMode,
     /// Outgoing connection attempts per second cap; None = unlimited.
     pub connect_rate: Option<u32>,
