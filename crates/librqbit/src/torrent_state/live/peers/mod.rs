@@ -208,6 +208,7 @@ mod tests {
             live_outgoing_peers: Default::default(),
             stats: Default::default(),
             states: Default::default(),
+            peer_backoff: None,
         }
     }
 
