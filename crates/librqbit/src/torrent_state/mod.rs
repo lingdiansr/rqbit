@@ -117,6 +117,7 @@ pub(crate) struct ManagedTorrentOptions {
     pub connect_rate: Option<u32>,
     /// Backoff config for dead outgoing peers; None = upstream defaults.
     pub peer_backoff: Option<crate::PeerBackoffConfig>,
+    pub peer_max_request_window: Option<usize>,
     pub allow_overwrite: bool,
     pub output_folder: PathBuf,
     pub ratelimits: LimitsConfig,

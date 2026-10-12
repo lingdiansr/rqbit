@@ -159,6 +159,13 @@ pub struct Session {
     peer_backoff: Option<crate::PeerBackoffConfig>,
 }
 
+/// A 40 character hex string is a v1 info hash. Checking the length alone
+/// also matches URLs that happen to be 40 characters long, such as
+/// https://nyaa.si/download/1234567.torrent.
+fn is_bare_info_hash(s: &str) -> bool {
+    s.len() == 40 && s.bytes().all(|b| b.is_ascii_hexdigit())
+}
+
 async fn torrent_from_url(
     reqwest_client: &reqwest::Client,
     url: &str,
@@ -758,7 +765,7 @@ impl Session {
 
             let blocklist = if let Some(blocklist_url) = opts.blocklist_url {
                 info!(url = blocklist_url, "loading p2p blocklist");
-                let bl = IpRanges::load_from_url(&blocklist_url)
+                let bl = IpRanges::load_from_url(&reqwest_client, &blocklist_url)
                     .await
                     .with_context(|| format!("error reading blocklist from {blocklist_url}"))?;
                 info!(len = bl.len(), "loaded blocklist");
@@ -769,7 +776,7 @@ impl Session {
 
             let allowlist = if let Some(allowlist_url) = opts.allowlist_url {
                 info!(url = allowlist_url, "loading p2p allowlist");
-                let al = IpRanges::load_from_url(&allowlist_url)
+                let al = IpRanges::load_from_url(&reqwest_client, &allowlist_url)
                     .await
                     .with_context(|| format!("error reading allowlist from {allowlist_url}"))?;
                 info!(len = al.len(), "loaded allowlist");
@@ -1132,6 +1139,7 @@ impl Session {
                         warn!(?addr, ?kind, "error handing over incoming connection: {e:#}");
                     }
                 },
+                else => continue,
             }
         }
     }
@@ -1164,6 +1172,9 @@ impl Session {
             mse_mode: self.mse_mode,
             handshake_timeout: other.handshake_timeout.or(self.peer_opts.handshake_timeout),
             connect_rate: other.connect_rate.or(self.peer_opts.connect_rate),
+            max_request_window: other
+                .max_request_window
+                .or(self.peer_opts.max_request_window),
         }
     }
 
@@ -1219,7 +1230,9 @@ impl Session {
         async move {
             let mut opts = opts.unwrap_or_default();
             let add_res = match add {
-                AddTorrent::Url(magnet) if magnet.starts_with("magnet:") || magnet.len() == 40 => {
+                AddTorrent::Url(magnet)
+                    if magnet.starts_with("magnet:") || is_bare_info_hash(&magnet) =>
+                {
                     let magnet = Magnet::parse(&magnet)
                         .context("provided path is not a valid magnet URL")?;
                     let info_hash = magnet
@@ -1482,6 +1495,7 @@ impl Session {
                     mse_mode: self.mse_mode,
                     connect_rate: peer_opts.connect_rate,
                     peer_backoff: self.peer_backoff.clone(),
+                    peer_max_request_window: peer_opts.max_request_window,
                     allow_overwrite: opts.overwrite,
                     output_folder,
                     ratelimits: opts.ratelimits,
@@ -1942,7 +1956,24 @@ mod tests {
     use itertools::Itertools;
     use librqbit_core::torrent_metainfo::{TorrentMetaV1, torrent_from_bytes};
 
-    use super::torrent_file_from_info_bytes;
+    use super::{is_bare_info_hash, torrent_file_from_info_bytes};
+
+    #[test]
+    fn test_is_bare_info_hash() {
+        assert!(is_bare_info_hash(
+            "08ada5a7a6183aae1e09d831df6748d566095a10"
+        ));
+        assert!(is_bare_info_hash(
+            "08ADA5A7A6183AAE1E09D831DF6748D566095A10"
+        ));
+        // 40 characters, but a URL.
+        assert!(!is_bare_info_hash(
+            "https://nyaa.si/download/2164312.torrent"
+        ));
+        assert!(!is_bare_info_hash(
+            "08ada5a7a6183aae1e09d831df6748d566095a1"
+        ));
+    }
 
     #[test]
     fn test_torrent_file_from_info_and_bytes() {
