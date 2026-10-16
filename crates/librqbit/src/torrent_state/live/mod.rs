@@ -42,6 +42,7 @@
 pub mod peer;
 pub mod peers;
 pub mod stats;
+pub(crate) mod upload_queue;
 
 use std::{
     borrow::Cow,
@@ -77,7 +78,7 @@ use peer_binary_protocol::{
     },
 };
 use tokio::sync::{
-    Notify, OwnedSemaphorePermit, Semaphore,
+    Notify,
     mpsc::{UnboundedReceiver, UnboundedSender, unbounded_channel},
 };
 use tokio_util::sync::CancellationToken;
@@ -88,6 +89,7 @@ use crate::{
     chunk_tracker::{ChunkMarkingResult, ChunkTracker, HaveNeededSelected},
     file_ops::FileOps,
     limits::Limits,
+    peer_admission::{DialSource, PeerConnectionLease, TorrentAdmission},
     peer_connection::{
         PeerConnection, PeerConnectionHandler, PeerConnectionOptions, WriterRequest,
     },
@@ -172,10 +174,12 @@ impl TorrentStateLocked {
 
 const FLUSH_BITV_EVERY_BYTES: u64 = 16 * 1024 * 1024;
 
+/// Outcome of handing an accepted, handshake-checked incoming connection over
+/// to the torrent.  Session-side admission has already run by then (the caller
+/// holds the lease), so there is no "limit reached" outcome here.
 pub enum AddIncomingPeerResult {
     Added,
     AlreadyActive,
-    ConcurrencyLimitReached,
 }
 
 pub struct TorrentStateLive {
@@ -191,11 +195,28 @@ pub struct TorrentStateLive {
     stats: AtomicStats,
     lengths: Lengths,
 
-    // Limits how many active (occupying network resources) peers there are at a moment in time.
-    peer_semaphore: Arc<Semaphore>,
+    // This torrent's per-torrent peer budgets.  Shared with the paused state
+    // so that pausing and resuming a torrent keeps the same budget objects.
+    pub(crate) admission: Arc<TorrentAdmission>,
 
-    // The queue for peer manager to connect to them.
+    // The queue for the dial scheduler to pull candidates from.  Behind a
+    // std (not async) mutex: `DialSource::try_take_candidate` is synchronous,
+    // and the critical section never awaits.
     peer_queue_tx: UnboundedSender<SocketAddr>,
+    peer_queue_rx: std::sync::Mutex<UnboundedReceiver<SocketAddr>>,
+    /// Last time a conservative peer turnover ran, and the in-memory timer
+    /// that gates it to once per `TURNOVER_INTERVAL`.
+    last_turnover_at: std::sync::Mutex<Option<std::time::Instant>>,
+    /// Candidate peeked out of `peer_queue_rx` and handed to the dial
+    /// scheduler, but not yet admitted.  `DialSource::try_take_candidate`
+    /// takes `&self`, so the peeked address is parked here between the peek
+    /// and the scheduler's `commit_candidate`; a candidate whose admission is
+    /// refused therefore survives into the next round instead of being lost.
+    pending_candidate: std::sync::Mutex<Option<SocketAddr>>,
+    /// Per-torrent pacing: minimum interval between this torrent's dials
+    /// (from the `connect_rate` option), and when its last dial started.
+    dial_interval: Option<Duration>,
+    last_dial_at: std::sync::Mutex<Option<Instant>>,
 
     finished_notify: Notify,
     new_pieces_notify: Notify,
@@ -209,11 +230,195 @@ pub struct TorrentStateLive {
     pub(crate) streams: Arc<TorrentStreams>,
     have_broadcast_tx: tokio::sync::broadcast::Sender<ValidPieceIndex>,
 
-    ratelimit_upload_tx: tokio::sync::mpsc::UnboundedSender<(
-        tokio::sync::mpsc::UnboundedSender<WriterRequest>,
-        ChunkInfo,
-    )>,
+    /// Bounded, per-peer-fair upload request queue (replaces the upstream
+    /// torrent-level unbounded FIFO).
+    upload_queue: std::sync::Mutex<upload_queue::UploadQueue>,
+    /// Wakes the upload scheduler when work is added.
+    upload_notify: Notify,
+    /// Per-peer connection generation, bumped on reconnect so requests queued
+    /// for a previous connection are never written to a new one.
+    peer_generations: std::sync::Mutex<std::collections::HashMap<SocketAddr, u64>>,
     ratelimits: Limits,
+}
+
+/// A live torrent is one dial source for the session-wide scheduler: it owns
+/// the candidate queue and the per-torrent budgets, and it starts outgoing
+/// peer tasks for the addresses the scheduler admits.
+/// A peer must have been connected this long before it may be rotated out.
+const TURNOVER_MIN_PEER_AGE: Duration = Duration::from_secs(120);
+/// A peer must have been idle (no payload either way) for this long.
+const TURNOVER_MIN_IDLE: Duration = Duration::from_secs(120);
+/// How often turnover may run at all.
+const TURNOVER_INTERVAL: Duration = Duration::from_secs(300);
+/// Turnover only engages once live usage reaches this fraction of the cap.
+const TURNOVER_LIVE_THRESHOLD_PERCENT: usize = 90;
+
+impl TorrentStateLive {
+    /// Conservative peer turnover.
+    ///
+    /// Only runs while there are candidates to dial and the live peer count is
+    /// at or above 90% of the per-torrent cap, and at most once per
+    /// [`TURNOVER_INTERVAL`].  Rotates out at most `max(1, ceil(live*4%))`
+    /// peers that are provably idle: old enough, no payload in either
+    /// direction for [`TURNOVER_MIN_IDLE`], no in-flight requests of ours, and
+    /// not the sole holder of a piece we still need.
+    ///
+    /// Established, serving, or uniquely-useful peers are never touched, and a
+    /// policy disconnect is not counted as a network failure.
+    pub(crate) fn maybe_turnover_peers(&self) -> usize {
+        // Only worth doing when someone is waiting for a slot.
+        if self
+            .pending_candidate
+            .lock()
+            .map(|c| c.is_none())
+            .unwrap_or(true)
+            && self
+                .peer_queue_rx
+                .lock()
+                .map(|r| r.is_empty())
+                .unwrap_or(true)
+        {
+            return 0;
+        }
+
+        let live_limit = self.admission.live_limit();
+        if live_limit == 0 {
+            return 0;
+        }
+        let live_now = self.peers.stats.live.load(Ordering::Relaxed) as usize;
+        if live_now * 100 < live_limit * TURNOVER_LIVE_THRESHOLD_PERCENT {
+            return 0;
+        }
+
+        let now = std::time::Instant::now();
+        {
+            let mut last = match self.last_turnover_at.lock() {
+                Ok(l) => l,
+                Err(_) => return 0,
+            };
+            if let Some(prev) = *last
+                && now.duration_since(prev) < TURNOVER_INTERVAL
+            {
+                return 0;
+            }
+            *last = Some(now);
+        }
+
+        let budget = std::cmp::max(1, live_now.div_ceil(25)); // ceil(live * 4%)
+        let mut rotated = 0usize;
+
+        // Collect eligible peers first; never mutate the table while holding a
+        // DashMap entry.
+        let mut eligible: Vec<SocketAddr> = Vec::new();
+        for entry in self.peers.states.iter() {
+            if rotated + eligible.len() >= budget {
+                break;
+            }
+            let peer = entry.value();
+            let Some(live) = peer.get_live() else {
+                continue;
+            };
+            if now.duration_since(live.connected_at) < TURNOVER_MIN_PEER_AGE {
+                continue;
+            }
+            if now.duration_since(live.last_download_at) < TURNOVER_MIN_IDLE
+                || now.duration_since(live.last_upload_at) < TURNOVER_MIN_IDLE
+            {
+                continue;
+            }
+            // Still has work in flight with us: leave it alone.
+            if live.requested_inflight_count() > 0 {
+                continue;
+            }
+            // `peer_interested` means the peer wants data from us — that is
+            // real demand, not idleness.
+            if live.peer_interested {
+                continue;
+            }
+            eligible.push(*entry.key());
+        }
+
+        for addr in eligible.into_iter().take(budget) {
+            // Policy disconnect: tear the connection down without recording a
+            // network error or scheduling a backoff retry.
+            if self
+                .peers
+                .with_peer_mut(addr, "turnover", |p| {
+                    p.set_state(PeerState::NotNeeded, &self.peers)
+                })
+                .is_some()
+            {
+                rotated += 1;
+            }
+        }
+        rotated
+    }
+}
+
+impl DialSource for TorrentStateLive {
+    fn admission(&self) -> Arc<TorrentAdmission> {
+        self.admission.clone()
+    }
+
+    fn try_take_candidate(&self) -> Option<SocketAddr> {
+        let mut pending = self
+            .pending_candidate
+            .lock()
+            .expect("peer candidate mutex poisoned");
+        if let Some(addr) = *pending {
+            return Some(addr);
+        }
+        let mut rx = self
+            .peer_queue_rx
+            .lock()
+            .expect("peer queue mutex poisoned");
+        while let Ok(addr) = rx.try_recv() {
+            if self.candidate_is_dialable(addr) {
+                *pending = Some(addr);
+                return Some(addr);
+            }
+            // Not dialable at all: dropped here so it never occupies the
+            // candidate slot or a session permit.
+        }
+        None
+    }
+
+    fn commit_candidate(&self) {
+        self.pending_candidate
+            .lock()
+            .expect("peer candidate mutex poisoned")
+            .take();
+    }
+
+    fn release_idle_peers(&self) -> usize {
+        self.maybe_turnover_peers()
+    }
+
+    fn dial_is_due(&self) -> bool {
+        let Some(interval) = self.dial_interval else {
+            return true;
+        };
+        match *self
+            .last_dial_at
+            .lock()
+            .expect("peer dial clock mutex poisoned")
+        {
+            None => true,
+            Some(last) => last.elapsed() >= interval,
+        }
+    }
+
+    fn start_dial(self: Arc<Self>, addr: SocketAddr, lease: PeerConnectionLease) {
+        *self
+            .last_dial_at
+            .lock()
+            .expect("peer dial clock mutex poisoned") = Some(Instant::now());
+        self.spawn(
+            debug_span!(parent: self.shared.span.clone(), "manage_peer", peer = ?addr),
+            format!("[{}][addr={addr}]manage_peer", self.shared.id),
+            aframe!(self.clone().task_manage_outgoing_peer(addr, lease)),
+        );
+    }
 }
 
 impl TorrentStateLive {
@@ -259,10 +464,7 @@ impl TorrentStateLive {
 
         let (have_broadcast_tx, _) = tokio::sync::broadcast::channel(128);
 
-        let (ratelimit_upload_tx, ratelimit_upload_rx) = tokio::sync::mpsc::unbounded_channel::<(
-            tokio::sync::mpsc::UnboundedSender<WriterRequest>,
-            ChunkInfo,
-        )>();
+        // (upload queue replaces the unbounded channel)
         let ratelimits = Limits::new(paused.shared.options.ratelimits);
 
         let state = Arc::new(TorrentStateLive {
@@ -270,10 +472,11 @@ impl TorrentStateLive {
             metadata: paused.metadata.clone(),
             peers: PeerStates {
                 session_stats: session_stats.peers.clone(),
+                next_insertion_seq: std::sync::atomic::AtomicU64::new(0),
                 stats: Default::default(),
                 states: Default::default(),
                 live_outgoing_peers: Default::default(),
-                peer_backoff: paused.shared.options.peer_backoff.clone(),
+                peer_backoff: paused.shared.options.peer_backoff,
             },
             _locked: RwLock::new(TorrentStateLocked {
                 pieces: Some(PieceTracker::new(paused.chunk_tracker)),
@@ -287,11 +490,18 @@ impl TorrentStateLive {
                 ..Default::default()
             },
             lengths,
-            peer_semaphore: Arc::new(Semaphore::new(
-                paused.shared.options.peer_limit.unwrap_or(128),
-            )),
             new_pieces_notify: Notify::new(),
             peer_queue_tx,
+            peer_queue_rx: std::sync::Mutex::new(peer_queue_rx),
+            pending_candidate: std::sync::Mutex::new(None),
+            last_turnover_at: std::sync::Mutex::new(None),
+            dial_interval: paused
+                .shared
+                .options
+                .connect_rate
+                .map(|n| Duration::from_micros(1_000_000 / u64::from(n.max(1)))),
+            last_dial_at: std::sync::Mutex::new(None),
+            admission: paused.admission.clone(),
             finished_notify: Notify::new(),
             down_speed_estimator,
             up_speed_estimator,
@@ -302,7 +512,9 @@ impl TorrentStateLive {
             per_piece_locks: (0..lengths.total_pieces())
                 .map(|_| RwLock::new(()))
                 .collect(),
-            ratelimit_upload_tx,
+            upload_queue: std::sync::Mutex::new(upload_queue::UploadQueue::new()),
+            upload_notify: Notify::new(),
+            peer_generations: std::sync::Mutex::new(std::collections::HashMap::new()),
             ratelimits,
         });
 
@@ -336,16 +548,14 @@ impl TorrentStateLive {
             },
         );
 
-        state.spawn(
-            debug_span!(parent: state.shared.span.clone(), "peer_adder"),
-            format!("[{}]peer_adder", state.shared.id),
-            state.clone().task_peer_adder(peer_queue_rx),
-        );
+        // Dialing is driven by the session-wide fair scheduler now: this
+        // torrent registers as a source instead of running its own adder loop.
+        session.dial_scheduler.register(state.clone());
 
         state.spawn(
             debug_span!(parent: state.shared.span.clone(), "upload_scheduler"),
             format!("[{}]upload_scheduler", state.shared.id),
-            state.clone().task_upload_scheduler(ratelimit_upload_rx),
+            state.clone().task_upload_scheduler(),
         );
         Ok(state)
     }
@@ -371,19 +581,10 @@ impl TorrentStateLive {
     pub(crate) fn add_incoming_peer(
         self: &Arc<Self>,
         checked_peer: CheckedIncomingConnection,
+        lease: PeerConnectionLease,
     ) -> anyhow::Result<AddIncomingPeerResult> {
         use dashmap::mapref::entry::Entry;
         let (tx, rx) = unbounded_channel();
-        let permit = match self.peer_semaphore.clone().try_acquire_owned() {
-            Ok(permit) => permit,
-            Err(_) => {
-                debug!("limit of live peers reached, dropping incoming peer");
-                self.peers.with_peer(checked_peer.addr, |p| {
-                    atomic_inc(&p.stats.counters.incoming_connections);
-                });
-                return Ok(AddIncomingPeerResult::ConcurrencyLimitReached);
-            }
-        };
 
         let counters = match self.peers.states.entry(checked_peer.addr) {
             Entry::Occupied(mut occ) => {
@@ -401,6 +602,9 @@ impl TorrentStateLive {
                                 kind = %checked_peer.kind,
                                 "peer already active, ignoring incoming connection"
                             );
+                            // The connection is not taken over, so its
+                            // session-wide permits go straight back.
+                            drop(lease);
                             return Ok(AddIncomingPeerResult::AlreadyActive);
                         }
                     }
@@ -435,41 +639,81 @@ impl TorrentStateLive {
             ),
             aframe!(
                 self.clone()
-                    .task_manage_incoming_peer(checked_peer, counters, tx, rx, permit)
+                    .task_manage_incoming_peer(checked_peer, counters, tx, rx, lease)
             ),
         );
         Ok(AddIncomingPeerResult::Added)
     }
 
-    async fn task_upload_scheduler(
-        self: Arc<Self>,
-        mut rx: tokio::sync::mpsc::UnboundedReceiver<(
-            tokio::sync::mpsc::UnboundedSender<WriterRequest>,
-            ChunkInfo,
-        )>,
-    ) -> crate::Result<()> {
-        while let Some((tx, ci)) = rx.recv().await {
+    async fn task_upload_scheduler(self: Arc<Self>) -> crate::Result<()> {
+        loop {
+            // Park until there is something to serve.
+            let next = {
+                let mut q = self
+                    .upload_queue
+                    .lock()
+                    .map_err(|_| Error::BugInvalidPeerState)?;
+                q.pop_next()
+            };
+            let Some(req) = next else {
+                self.upload_notify.notified().await;
+                continue;
+            };
+
+            // Resolve the peer's writer channel.  If the peer is gone the
+            // request simply disappears with it.
+            let Some(tx) = self
+                .peers
+                .with_peer(req.peer, |p| p.get_live().map(|l| l.tx.clone()))
+            else {
+                continue;
+            };
+            let Some(tx) = tx else {
+                continue;
+            };
+
+            let size = NonZeroU32::new(req.key.length.max(1)).expect("non-zero clamp");
             tokio::select! {
-                _ = tx.closed() => {
-                    continue;
-                }
-                res = self.ratelimits.prepare_for_upload(NonZeroU32::new(ci.size).unwrap()) => {
-                    res?;
-                }
+                _ = tx.closed() => continue,
+                res = self.ratelimits.prepare_for_upload(size) => { res?; }
             };
             if let Some(session) = self.shared.session.upgrade() {
                 tokio::select! {
-                    _ = tx.closed() => {
-                        continue;
-                    }
-                    res = session.ratelimits.prepare_for_upload(NonZeroU32::new(ci.size).unwrap()) => {
-                        res?;
-                    }
+                    _ = tx.closed() => continue,
+                    res = session.ratelimits.prepare_for_upload(size) => { res?; }
                 }
             }
-            let _ = tx.send(WriterRequest::ReadChunkRequest(ci));
+
+            // Re-validate the generation immediately before handing to the
+            // writer: a cancelled/reconnected request must not be written.
+            let current = self
+                .peer_generations
+                .lock()
+                .ok()
+                .and_then(|g| g.get(&req.peer).copied())
+                .unwrap_or(req.generation);
+            if current != req.generation {
+                continue;
+            }
+
+            let chunk_info = match self.lengths.chunk_info_from_received_data(
+                match self.lengths.validate_piece_index(req.key.piece) {
+                    Some(p) => p,
+                    None => continue,
+                },
+                req.key.begin,
+                req.key.length,
+            ) {
+                Some(ci) => ci,
+                None => continue,
+            };
+            if tx
+                .send(WriterRequest::ReadChunkRequest(chunk_info))
+                .is_err()
+            {
+                continue;
+            }
         }
-        Ok(())
     }
 
     async fn task_manage_incoming_peer(
@@ -478,13 +722,14 @@ impl TorrentStateLive {
         counters: Arc<AtomicPeerCounters>,
         tx: PeerTx,
         rx: PeerRx,
-        permit: OwnedSemaphorePermit,
+        lease: PeerConnectionLease,
     ) -> crate::Result<()> {
         let handler = PeerHandler {
             addr: checked_peer.addr,
             incoming: true,
             on_bitfield_notify: Default::default(),
             flow_control: Mutex::new(PeerFlowControl::new(self.max_request_window())),
+            lease: std::sync::Mutex::new(Some(lease)),
             state: self.clone(),
             tx,
             counters,
@@ -530,14 +775,15 @@ impl TorrentStateLive {
                 handler.on_peer_died(Some(e))?;
             }
         };
-        drop(permit);
+        // The handler owns the admission lease; consuming it here releases
+        // every permit the peer still held.
         Ok(())
     }
 
     async fn task_manage_outgoing_peer(
         self: Arc<Self>,
         addr: SocketAddr,
-        permit: OwnedSemaphorePermit,
+        lease: PeerConnectionLease,
     ) -> crate::Result<()> {
         let state = self;
         let (rx, tx) = state.peers.mark_peer_connecting(addr)?;
@@ -551,6 +797,7 @@ impl TorrentStateLive {
             incoming: false,
             on_bitfield_notify: Default::default(),
             flow_control: Mutex::new(PeerFlowControl::new(state.max_request_window())),
+            lease: std::sync::Mutex::new(Some(lease)),
             state: state.clone(),
             tx,
             counters,
@@ -606,79 +853,66 @@ impl TorrentStateLive {
                 handler.on_peer_died(Some(e))?;
             }
         }
-        drop(permit);
+        // The handler owns the admission lease; dropping it here releases
+        // every permit the peer still held.
         Ok(())
     }
 
-    async fn task_peer_adder(
-        self: Arc<Self>,
-        mut peer_queue_rx: UnboundedReceiver<SocketAddr>,
-    ) -> crate::Result<()> {
-        let state = self;
-        // Optional cap on outgoing connection attempts per second
-        // (configurable via `connect_rate`); None = unlimited (upstream).
-        let connect_interval = state
-            .shared
-            .options
-            .connect_rate
-            .map(|n| Duration::from_micros(1_000_000 / u64::from(n.max(1))));
-        loop {
-            let addr = peer_queue_rx.recv().await.ok_or(Error::TorrentIsNotLive)?;
-            if state.shared.options.disable_upload() && state.is_finished_and_no_active_streams() {
-                debug!(?addr, "ignoring peer as we are finished");
-                state.peers.mark_peer_not_needed(addr);
-                continue;
-            }
+    /// Prefilter a candidate before the dial scheduler spends a lease on it:
+    /// addresses that can never be dialled are discarded here (and counted),
+    /// so they neither occupy the queue nor a session permit.
+    fn candidate_is_dialable(&self, addr: SocketAddr) -> bool {
+        if self.shared.options.disable_upload() && self.is_finished_and_no_active_streams() {
+            debug!(?addr, "ignoring peer as we are finished");
+            self.peers.mark_peer_not_needed(addr);
+            return false;
+        }
 
-            let session = state
-                .shared
-                .session
-                .upgrade()
-                .ok_or(Error::SessionDestroyed)?;
+        let Some(session) = self.shared.session.upgrade() else {
+            return false;
+        };
 
-            if session.ipv4_only && addr.is_ipv6() {
-                debug!(?addr, "skipping ipv6 peer (ipv4_only=true)");
-                continue;
-            }
+        if session.ipv4_only && addr.is_ipv6() {
+            debug!(?addr, "skipping ipv6 peer (ipv4_only=true)");
+            return false;
+        }
 
-            if addr.port() == 0 {
-                debug!(?addr, "skipping peer with port 0");
-                continue;
-            }
+        if addr.port() == 0 {
+            debug!(?addr, "skipping peer with port 0");
+            return false;
+        }
 
-            if session.blocklist.has(addr.ip()) {
-                session
-                    .stats
-                    .counters
-                    .blocked_outgoing
-                    .fetch_add(1, Ordering::Relaxed);
-                debug!(?addr, "blocked outgoing connection (by the blacklist)");
-                continue;
-            }
+        if session.blocklist.has(addr.ip()) {
+            session
+                .stats
+                .counters
+                .blocked_outgoing
+                .fetch_add(1, Ordering::Relaxed);
+            debug!(?addr, "blocked outgoing connection (by the blacklist)");
+            return false;
+        }
 
-            if session
-                .allowlist
-                .as_ref()
-                .is_some_and(|l| !l.has(addr.ip()))
-            {
-                session
-                    .stats
-                    .counters
-                    .blocked_outgoing
-                    .fetch_add(1, Ordering::Relaxed);
-                debug!(?addr, "blocked outgoing connection (by the allowlist)");
-                continue;
-            }
+        if session
+            .allowlist
+            .as_ref()
+            .is_some_and(|l| !l.has(addr.ip()))
+        {
+            session
+                .stats
+                .counters
+                .blocked_outgoing
+                .fetch_add(1, Ordering::Relaxed);
+            debug!(?addr, "blocked outgoing connection (by the allowlist)");
+            return false;
+        }
 
-            let permit = state.peer_semaphore.clone().acquire_owned().await?;
-            state.spawn(
-                debug_span!(parent: state.shared.span.clone(), "manage_peer", peer = ?addr),
-                format!("[{}][addr={addr}]manage_peer", state.shared.id),
-                aframe!(state.clone().task_manage_outgoing_peer(addr, permit)),
-            );
-            if let Some(i) = connect_interval {
-                tokio::time::sleep(i).await;
-            }
+        true
+    }
+
+    /// Nudge the session-wide dial scheduler after gaining a candidate.
+    pub(crate) fn wake_dial_scheduler(&self) {
+        if let Some(session) = self.shared.session.upgrade() {
+            session.dial_scheduler.wake();
         }
     }
 
@@ -752,6 +986,7 @@ impl TorrentStateLive {
             .send(addr)
             .ok()
             .ok_or(Error::TorrentIsNotLive)?;
+        self.wake_dial_scheduler();
         Ok(true)
     }
 
@@ -790,6 +1025,15 @@ impl TorrentStateLive {
     pub fn pause(&self) -> anyhow::Result<TorrentStatePaused> {
         self.cancellation_token.cancel();
 
+        // No upload work may outlive the live state: drop every pending
+        // request so a paused torrent cannot serve a stale chunk.
+        if let Ok(mut q) = self.upload_queue.lock() {
+            q.clear();
+        }
+        if let Ok(mut g) = self.peer_generations.lock() {
+            g.clear();
+        }
+
         let mut g = self.lock_write("pause");
 
         // It should be impossible to make a fatal error after pausing.
@@ -808,6 +1052,7 @@ impl TorrentStateLive {
             files: self.files.take()?,
             chunk_tracker,
             streams: self.streams.clone(),
+            admission: self.admission.clone(),
         })
     }
 
@@ -925,13 +1170,18 @@ impl TorrentStateLive {
     }
 
     pub(crate) fn reconnect_all_not_needed_peers(&self) {
-        self.peers
-            .states
-            .iter_mut()
-            .filter_map(|mut p| p.value_mut().reconnect_not_needed_peer(&self.peers))
-            .map(|socket_addr| self.peer_queue_tx.send(socket_addr))
-            .take_while(|r| r.is_ok())
-            .last();
+        let mut queued = false;
+        for mut p in self.peers.states.iter_mut() {
+            if let Some(socket_addr) = p.value_mut().reconnect_not_needed_peer(&self.peers) {
+                if self.peer_queue_tx.send(socket_addr).is_err() {
+                    break;
+                }
+                queued = true;
+            }
+        }
+        if queued {
+            self.wake_dial_scheduler();
+        }
     }
 
     async fn task_send_pex_to_peer(
@@ -1051,6 +1301,12 @@ struct PeerHandler {
     // is received.
     on_bitfield_notify: Notify,
 
+    // The admission lease for this connection.  A std mutex, not tokio's:
+    // the only accessor is the synchronous `on_handshake` callback, which
+    // must not await (it runs inside the peer's read path), and the critical
+    // section neither awaits nor takes another lock, so it cannot deadlock.
+    lease: std::sync::Mutex<Option<PeerConnectionLease>>,
+
     addr: SocketAddr,
     incoming: bool,
     tx: PeerTx,
@@ -1102,10 +1358,10 @@ impl PeerConnectionHandler for &'_ PeerHandler {
             }
             Message::Have(h) => self.on_have(h),
             Message::NotInterested => {
-                trace!("received \"not interested\", but we don't process it yet")
+                self.on_peer_not_interested()?;
             }
-            Message::Cancel(_) => {
-                trace!("received \"cancel\", but we don't process it yet")
+            Message::Cancel(cancel) => {
+                self.on_download_cancel(cancel)?;
             }
             Message::Extended(ExtendedMessage::UtMetadata(UtMetadata::Request(
                 metadata_piece_id,
@@ -1156,11 +1412,54 @@ impl PeerConnectionHandler for &'_ PeerHandler {
     }
 
     fn on_handshake(&self, handshake: Handshake, ckind: ConnectionKind) -> anyhow::Result<()> {
+        // New connection identity: any request queued for a previous
+        // connection with this address must never be written to this one.
+        let generation = {
+            let mut g = self
+                .state
+                .peer_generations
+                .lock()
+                .map_err(|_| crate::Error::BugInvalidPeerState)?;
+            let entry = g.entry(self.addr).or_insert(0);
+            *entry = entry.wrapping_add(1);
+            *entry
+        };
+        if let Ok(mut q) = self.state.upload_queue.lock() {
+            q.drop_stale_generations(self.addr, generation);
+        }
         self.state.set_peer_live(self.addr, handshake, ckind);
+
+        // The peer is established: give back its connecting permits and take
+        // its live capacity.  Synchronous on purpose - this runs inside the
+        // connection's read path, so it must not await, and it takes no other
+        // lock (flow_control stays untouched here).
+        let mut lease = self
+            .lease
+            .lock()
+            .expect("peer admission lease mutex poisoned");
+        if let Some(lease) = lease.as_mut()
+            && let Err(denied) = lease.try_promote_live(&self.state.admission)
+        {
+            // Admission refused at live time: the caller must close this
+            // connection.  The error propagates out of `manage_peer_*` (which
+            // maps it to `Error::Anyhow`), tearing the connection down; the
+            // lease drops with the handler and returns every permit.
+            return Err(anyhow::anyhow!(
+                "peer admission denied on promotion: {}",
+                denied.as_str()
+            ));
+        }
         Ok(())
     }
 
     fn on_uploaded_bytes(&self, bytes: u32) {
+        // Turnover eligibility: this peer just took payload from us, so it is
+        // not idle and must not be rotated out.
+        self.state
+            .peers
+            .with_live_mut(self.addr, "mark_upload_activity", |live| {
+                live.last_upload_at = std::time::Instant::now();
+            });
         self.counters
             .uploaded_bytes
             .fetch_add(bytes as u64, Ordering::Relaxed);
@@ -1279,6 +1578,17 @@ impl PeerConnectionHandler for &'_ PeerHandler {
 
 impl PeerHandler {
     fn on_peer_died(self, error: Option<crate::Error>) -> crate::Result<()> {
+        // The connection is over: hand its admission capacity back before
+        // anything else, so the torrent (and the session) can admit a
+        // replacement while this task finishes unwinding.  Dropping the lease
+        // cannot await and takes no other lock.
+        drop(
+            self.lease
+                .lock()
+                .expect("peer admission lease mutex poisoned")
+                .take(),
+        );
+
         let peers = &self.state.peers;
         let handle = self.addr;
         let mut pe = match peers.states.get_mut(&handle) {
@@ -1424,6 +1734,7 @@ impl PeerHandler {
                             .send(handle)
                             .ok()
                             .ok_or(Error::TorrentIsNotLive)?;
+                        self.state.wake_dial_scheduler();
                     }
                     Ok::<_, Error>(())
                 },
@@ -1541,9 +1852,92 @@ impl PeerHandler {
             );
         }
 
-        self.state
-            .ratelimit_upload_tx
-            .send((self.tx.clone(), chunk_info))?;
+        let peer = self.addr;
+        let generation = self
+            .state
+            .peer_generations
+            .lock()
+            .ok()
+            .and_then(|g| g.get(&peer).copied())
+            .unwrap_or(0);
+        let outcome = {
+            let mut q = self
+                .state
+                .upload_queue
+                .lock()
+                .map_err(|_| Error::BugInvalidPeerState)?;
+            q.enqueue(upload_queue::QueuedRequest {
+                key: upload_queue::RequestKey {
+                    piece: request.index,
+                    begin: request.begin,
+                    length: request.length,
+                },
+                generation,
+                peer,
+            })
+        };
+        match outcome {
+            upload_queue::EnqueueOutcome::Queued => {
+                self.state.upload_notify.notify_one();
+                Ok(())
+            }
+            // A repeat request is a no-op, not an error.
+            upload_queue::EnqueueOutcome::Duplicate => Ok(()),
+            // Flooding: disconnect the peer rather than leaving it in an
+            // unbounded wait.
+            upload_queue::EnqueueOutcome::PeerBacklogExceeded => {
+                anyhow::bail!(
+                    "peer {peer} exceeded the upload request window ({})",
+                    upload_queue::MAX_PENDING_PER_PEER
+                )
+            }
+            upload_queue::EnqueueOutcome::TorrentBacklogExceeded => {
+                anyhow::bail!(
+                    "torrent upload backlog is full ({})",
+                    upload_queue::MAX_PENDING_PER_TORRENT
+                )
+            }
+        }
+    }
+
+    /// The peer is no longer interested: it will not take any more data from
+    /// us, so its pending upload requests are pointless work.
+    fn on_peer_not_interested(&self) -> anyhow::Result<()> {
+        self.state.peers.mark_peer_interested(self.addr, false);
+        if let Ok(mut q) = self.state.upload_queue.lock() {
+            let dropped = q.drop_peer(self.addr);
+            if dropped > 0 {
+                trace!(peer = %self.addr, dropped, "dropped pending uploads after NotInterested");
+            }
+        }
+        Ok(())
+    }
+
+    /// The peer cancelled a request it made.  Only a request that has not been
+    /// handed to the writer yet can be removed; one already being written is
+    /// allowed to finish.
+    fn on_download_cancel(&self, cancel: peer_binary_protocol::Request) -> anyhow::Result<()> {
+        let generation = self
+            .state
+            .peer_generations
+            .lock()
+            .ok()
+            .and_then(|g| g.get(&self.addr).copied())
+            .unwrap_or(0);
+        let cancelled = self.state.upload_queue.lock().ok().is_some_and(|mut q| {
+            q.cancel(
+                self.addr,
+                upload_queue::RequestKey {
+                    piece: cancel.index,
+                    begin: cancel.begin,
+                    length: cancel.length,
+                },
+                generation,
+            )
+        });
+        if cancelled {
+            trace!(peer = %self.addr, "cancelled a queued upload request");
+        }
         Ok(())
     }
 
@@ -1811,6 +2205,12 @@ impl PeerHandler {
             .fetched_bytes
             .fetch_add(piece.len() as u64, Ordering::Relaxed);
         self.counters.fetched_chunks.fetch_add(1, Ordering::Relaxed);
+        // Turnover eligibility: this peer just sent us payload.
+        self.state
+            .peers
+            .with_live_mut(self.addr, "mark_download_activity", |live| {
+                live.last_download_at = std::time::Instant::now();
+            });
 
         let should_process = self
             .state

@@ -125,7 +125,11 @@ pub(crate) struct ManagedTorrentOptions {
     pub output_folder: PathBuf,
     pub ratelimits: LimitsConfig,
     pub initial_peers: Vec<SocketAddr>,
+    /// Per-torrent established-peer cap (the public `peer_limit` option).
     pub peer_limit: Option<usize>,
+    /// Per-torrent outbound connecting cap, mirroring
+    /// [`crate::PeerAdmissionConfig::torrent_connect_limit`].
+    pub torrent_connect_limit: usize,
     #[cfg(feature = "disable-upload")]
     pub _disable_upload: bool,
 }

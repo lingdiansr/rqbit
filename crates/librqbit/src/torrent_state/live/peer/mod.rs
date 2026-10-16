@@ -30,6 +30,9 @@ pub(crate) struct Peer {
     state: PeerState,
     pub stats: stats::atomic::PeerStats,
     pub outgoing_address: Option<SocketAddr>,
+    /// Monotonic insertion order, used to evict the *oldest* candidate first
+    /// when the bounded pool is full.
+    pub insertion_seq: u64,
 }
 
 impl Peer {
@@ -49,18 +52,43 @@ impl Peer {
             state,
             stats: Default::default(),
             outgoing_address: None,
+            insertion_seq: 0,
         }
     }
 
     pub fn new_with_outgoing_address(
         addr: SocketAddr,
         backoff_config: Option<crate::PeerBackoffConfig>,
+        insertion_seq: u64,
     ) -> Self {
         Self {
             addr,
             outgoing_address: Some(addr),
             stats: stats::atomic::PeerStats::with_backoff_config(backoff_config),
             state: Default::default(),
+            insertion_seq,
+        }
+    }
+
+    /// Whether this peer's slot may be reclaimed to make room for a new
+    /// candidate.  Established/valuable connections are never evicted this
+    /// way — only peers we are not currently using.
+    pub(crate) fn is_evictable_candidate(&self) -> bool {
+        matches!(
+            self.state,
+            PeerState::Dead | PeerState::NotNeeded | PeerState::Queued
+        )
+    }
+
+    /// Eviction rank: lower is evicted first.
+    pub(crate) fn eviction_rank(&self) -> u8 {
+        match self.state {
+            PeerState::Dead => 0,
+            PeerState::NotNeeded => 1,
+            PeerState::Queued => 2,
+            // Never evicted; a high rank keeps it out of the way if this is
+            // ever consulted defensively.
+            PeerState::Connecting(_) | PeerState::Live(_) => u8::MAX,
         }
     }
 
@@ -283,6 +311,14 @@ pub(crate) struct LivePeerState {
     pub tx: PeerTx,
 
     pub connection_kind: ConnectionKind,
+
+    // --- Turnover bookkeeping (see `TorrentStateLive::maybe_turnover_peers`) ---
+    /// When this connection was established.
+    pub connected_at: std::time::Instant,
+    /// Last time this peer sent us payload (we downloaded from it).
+    pub last_download_at: std::time::Instant,
+    /// Last time this peer took payload from us (we uploaded to it).
+    pub last_upload_at: std::time::Instant,
 }
 
 impl LivePeerState {
@@ -303,6 +339,9 @@ impl LivePeerState {
             request_slots_changed: Default::default(),
             tx,
             connection_kind,
+            connected_at: std::time::Instant::now(),
+            last_download_at: std::time::Instant::now(),
+            last_upload_at: std::time::Instant::now(),
         }
     }
 

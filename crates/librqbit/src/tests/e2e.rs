@@ -15,8 +15,8 @@ use crate::{
     listen::ListenerOptions,
     spawn_utils::BlockingSpawner,
     tests::test_util::{
-        DropChecks, TestPeerMetadata, create_default_random_dir_with_torrents, setup_test_logging,
-        wait_until_i_am_the_last_task,
+        DropChecks, TestPeerMetadata, create_default_random_dir_with_torrents,
+        create_new_file_with_random_content, setup_test_logging, wait_until_i_am_the_last_task,
     },
 };
 
@@ -375,5 +375,174 @@ async fn _test_e2e_download(mode: ListenerMode, drop_checks: &DropChecks) {
         );
 
         info!("all good");
+    }
+}
+
+/// A `.bitv` that claims a piece the payload does not actually contain must be
+/// rejected by `validate_fastresume`, not silently trusted.
+///
+/// Regression for the upstream `check_piece(..).is_err()`-only check: a SHA1
+/// mismatch returns `Ok(false)` and used to be treated as "piece is fine",
+/// restoring a phantom piece that is never re-downloaded and leaving a
+/// zero-filled hole in the "finished" file.
+/// A `.bitv` that claims a piece the payload does not actually contain must be
+/// rejected by `validate_fastresume`, not silently trusted.
+///
+/// Regression for the upstream `check_piece(..).is_err()`-only check: a SHA1
+/// mismatch returns `Ok(false)` and used to be treated as "piece is fine",
+/// restoring a phantom piece that is never re-downloaded and leaving a
+/// zero-filled hole in the "finished" file.
+#[tokio::test]
+async fn test_fastresume_rejects_phantom_have_piece() -> anyhow::Result<()> {
+    setup_test_logging();
+
+    let piece_length: u32 = 32 * 1024;
+    let file_length: usize = 300_000; // 10 pieces, last one partial
+
+    // A single-file torrent is laid out as `<parent>/<file name>`, and
+    // `create_torrent`'s output folder is that parent -- so pointing the
+    // session's output folder at it puts the payload exactly where the torrent
+    // expects it, with no network involved.
+    let dir = tempfile::TempDir::with_prefix("rqbit_fastresume")?;
+    let name = "payload.bin";
+    let payload_file = dir.path().join(name);
+    create_new_file_with_random_content(&payload_file, file_length);
+    let outdir = dir.path().to_owned();
+
+    let torrent_file = create_torrent(
+        &payload_file,
+        crate::CreateTorrentOptions {
+            piece_length: Some(piece_length),
+            ..Default::default()
+        },
+        &BlockingSpawner::new(1),
+    )
+    .await?;
+    let torrent_bytes = torrent_file.as_bytes()?;
+
+    let persistence = tempfile::TempDir::with_prefix("rqbit_fastresume_session")?.keep();
+    std::fs::create_dir_all(&persistence)?;
+    let session_opts = || SessionOptions {
+        dht: None,
+        persistence: Some(SessionPersistenceConfig::Json {
+            folder: Some(persistence.clone()),
+        }),
+        disable_local_service_discovery: true,
+        fastresume: true,
+        ..Default::default()
+    };
+
+    // 1. First run over the good payload: the initial check must find every
+    //    piece and persist that fact as a `.bitv`.
+    {
+        let session = Session::new_with_opts(outdir.clone(), session_opts())
+            .await
+            .context("start first session")?;
+        let handle = match session
+            .add_torrent(
+                crate::AddTorrent::TorrentFileBytes(torrent_bytes.clone()),
+                Some(AddTorrentOptions {
+                    paused: true,
+                    overwrite: true,
+                    ..Default::default()
+                }),
+            )
+            .await
+            .context("add to first session")?
+        {
+            AddTorrentResponse::Added(_, handle) => handle,
+            AddTorrentResponse::AlreadyManaged(_, handle) => handle,
+            AddTorrentResponse::ListOnly(_) => bail!("unexpected list-only response"),
+        };
+
+        let needed = timeout(Duration::from_secs(60), wait_needed_bytes(&handle))
+            .await
+            .context("timed out waiting for the first initial check")?;
+        assert_eq!(needed, 0, "first run must see a complete payload");
+
+        // No `delete`: that would remove the `.bitv` along with the rest of
+        // the persistence entry. Dropping the session is enough to release it.
+        drop(handle);
+        drop(session);
+    }
+
+    // The `.bitv` is keyed by info hash and preserved by `delete(.., false)`.
+    let bitv_path = std::fs::read_dir(&persistence)?
+        .filter_map(Result::ok)
+        .map(|e| e.path())
+        .find(|p| p.extension().is_some_and(|x| x == "bitv"))
+        .context("first run must have written a .bitv")?;
+    let actual_bitv_len = std::fs::metadata(&bitv_path)?.len();
+    let expected_bitv_len = (file_length as u64)
+        .div_ceil(u64::from(piece_length))
+        .div_ceil(8);
+    assert_eq!(
+        actual_bitv_len, expected_bitv_len,
+        "unexpected .bitv length at {bitv_path:?}"
+    );
+
+    // 2. Forge the exact phantom state: the `.bitv` claims to have every piece
+    //    while piece 0 on disk is corrupted. `validate_fastresume` always
+    //    checks the first have-piece of each file, so it must hit piece 0 and
+    //    fall back to a full check instead of trusting the forge.
+    let bitv_len = usize::try_from(actual_bitv_len).context("bitv length fits in usize")?;
+    std::fs::write(&bitv_path, vec![0xFFu8; bitv_len])?;
+    {
+        use std::io::{Seek, SeekFrom, Write};
+        let mut f = std::fs::OpenOptions::new()
+            .write(true)
+            .open(&payload_file)
+            .context("open payload to corrupt")?;
+        f.seek(SeekFrom::Start(0))?;
+        f.write_all(&[0xA5u8; 4096])?;
+        f.sync_all()?;
+    }
+
+    // 3. Second run with the same payload + persistence.
+    let session = Session::new_with_opts(outdir.clone(), session_opts())
+        .await
+        .context("start second session")?;
+    let handle = session
+        .add_torrent(
+            crate::AddTorrent::TorrentFileBytes(torrent_bytes),
+            Some(AddTorrentOptions {
+                paused: true,
+                overwrite: true,
+                ..Default::default()
+            }),
+        )
+        .await
+        .context("add to second session")?
+        .into_handle()
+        .context("expected a handle, not a list-only response")?;
+
+    let needed = timeout(Duration::from_secs(60), wait_needed_bytes(&handle))
+        .await
+        .context("timed out waiting for the second initial check")?;
+
+    assert!(
+        needed >= u64::from(piece_length),
+        "corrupted piece 0 was restored from the forged .bitv as have; \
+         validate_fastresume accepted a hash mismatch (needed_bytes={needed})"
+    );
+
+    Ok(())
+}
+
+/// Resolves once the paused torrent's chunk tracker is available, yielding the
+/// bytes it still needs (0 == it believes the payload is complete).
+async fn wait_needed_bytes(handle: &crate::torrent_state::ManagedTorrentHandle) -> u64 {
+    use crate::ManagedTorrentState;
+
+    let mut interval = interval(Duration::from_millis(50));
+    loop {
+        interval.tick().await;
+        let needed = handle.with_state(|s| match s {
+            ManagedTorrentState::Paused(p) => Some(p.chunk_tracker.get_hns().needed_bytes),
+            _ => None,
+        });
+        if let Some(needed) = needed {
+            return needed;
+        }
     }
 }

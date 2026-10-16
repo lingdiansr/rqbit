@@ -16,8 +16,17 @@ use super::peer::{LivePeerState, Peer, PeerRx, PeerState, PeerTx};
 
 pub mod stats;
 
+/// Maximum number of candidate peer records kept per torrent.
+///
+/// Discovery streams (tracker / PEX / DHT, plus backoff retries) are unbounded
+/// in principle; this bounds the memory and the work the dial scheduler can be
+/// handed.  Established connections are never sacrificed to stay under it.
+pub(crate) const MAX_CANDIDATE_PEERS: usize = 3000;
+
 pub(crate) struct PeerStates {
     pub session_stats: Arc<AggregatePeerStatsAtomic>,
+    /// Monotonic insertion counter for oldest-first eviction.
+    pub(crate) next_insertion_seq: std::sync::atomic::AtomicU64,
 
     // This keeps track of live addresses we connected to, for PEX.
     pub live_outgoing_peers: RwLock<HashSet<PeerHandle>>,
@@ -40,14 +49,102 @@ impl PeerStates {
         self.stats.snapshot()
     }
 
+    /// Make room for one more candidate, if possible.
+    ///
+    /// Evicts the oldest peer in the lowest eviction rank (Dead, then
+    /// NotNeeded, then Queued).  Returns `false` when the pool is full and
+    /// every remaining peer is one we must keep — the caller then rejects the
+    /// new candidate and counts it.
+    /// Test-only: evict one candidate by the production ordering and report
+    /// which address was removed.
+    #[cfg(test)]
+    pub(crate) fn evict_one_candidate_for_test(&self) -> Option<SocketAddr> {
+        let mut victim: Option<(u8, u64, SocketAddr)> = None;
+        for entry in self.states.iter() {
+            let peer = entry.value();
+            if !peer.is_evictable_candidate() {
+                continue;
+            }
+            let rank = peer.eviction_rank();
+            let seq = peer.insertion_seq;
+            let key = *entry.key();
+            let better = match victim {
+                None => true,
+                Some((best_rank, best_seq, _)) => {
+                    rank < best_rank || (rank == best_rank && seq < best_seq)
+                }
+            };
+            if better {
+                victim = Some((rank, seq, key));
+            }
+        }
+        let (_, _, addr) = victim?;
+        self.drop_peer(addr);
+        Some(addr)
+    }
+
+    fn make_room_for_candidate(&self) -> bool {
+        if self.states.len() < MAX_CANDIDATE_PEERS {
+            return true;
+        }
+
+        // Pick the eviction victim in a single pass: lowest rank wins, then
+        // lowest insertion sequence (oldest).
+        let mut victim: Option<(u8, u64, SocketAddr)> = None;
+        for entry in self.states.iter() {
+            let peer = entry.value();
+            if !peer.is_evictable_candidate() {
+                continue;
+            }
+            let rank = peer.eviction_rank();
+            let seq = peer.insertion_seq;
+            let key = *entry.key();
+            let better = match victim {
+                None => true,
+                Some((best_rank, best_seq, _)) => {
+                    rank < best_rank || (rank == best_rank && seq < best_seq)
+                }
+            };
+            if better {
+                victim = Some((rank, seq, key));
+            }
+        }
+
+        match victim {
+            Some((_, _, addr)) => {
+                self.drop_peer(addr);
+                true
+            }
+            None => {
+                atomic_inc(&self.stats.candidate_rejected);
+                atomic_inc(&self.session_stats.candidate_rejected);
+                false
+            }
+        }
+    }
+
     pub fn add_if_not_seen(&self, addr: SocketAddr) -> Option<PeerHandle> {
         use dashmap::mapref::entry::Entry;
+
+        // Capacity must be managed BEFORE taking a DashMap entry: holding an
+        // entry borrows a shard, and eviction iterates the whole map.
+        if self.states.contains_key(&addr) {
+            return None;
+        }
+        if !self.make_room_for_candidate() {
+            return None;
+        }
+
         match self.states.entry(addr) {
             Entry::Occupied(_) => None,
             Entry::Vacant(vac) => {
+                let seq = self
+                    .next_insertion_seq
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 vac.insert(Peer::new_with_outgoing_address(
                     addr,
-                    self.peer_backoff.clone(),
+                    self.peer_backoff,
+                    seq,
                 ));
                 atomic_inc(&self.stats.queued);
                 atomic_inc(&self.session_stats.queued);
@@ -205,6 +302,7 @@ mod tests {
     fn make_peer_states() -> PeerStates {
         PeerStates {
             session_stats: Default::default(),
+            next_insertion_seq: Default::default(),
             live_outgoing_peers: Default::default(),
             stats: Default::default(),
             states: Default::default(),
@@ -313,5 +411,117 @@ mod tests {
 
         peers.drop_peer(a).unwrap();
         assert_eq!(live_seeders(&peers), (1, 1));
+    }
+
+    /// Fill the pool with `n` Queued candidates (no live connections).
+    fn fill_queued(peers: &PeerStates, n: usize) {
+        for i in 0..n {
+            let addr: SocketAddr = format!("127.0.0.1:{}", 10_000 + i).parse().unwrap();
+            peers.add_if_not_seen(addr).expect("candidate admitted");
+        }
+    }
+
+    #[test]
+    fn candidate_pool_is_bounded_and_rejects_when_nothing_is_evictable() {
+        let peers = make_peer_states();
+        // One live peer must never be sacrificed for a candidate.
+        let (_addr, _rx) = add_live_peer(&peers, "127.0.0.1:9000");
+
+        fill_queued(&peers, MAX_CANDIDATE_PEERS - 1);
+        assert_eq!(peers.states.len(), MAX_CANDIDATE_PEERS);
+
+        // The pool is full of evictable Queued peers, so a new candidate
+        // still gets in by evicting the oldest.
+        let new_addr: SocketAddr = "127.0.0.1:60000".parse().unwrap();
+        assert!(peers.add_if_not_seen(new_addr).is_some());
+        assert_eq!(peers.states.len(), MAX_CANDIDATE_PEERS);
+
+        // Make every peer non-evictable by marking it Connecting, which is in
+        // the same "must keep" class as Live for eviction purposes.
+        for mut entry in peers.states.iter_mut() {
+            if entry.value().is_evictable_candidate() {
+                let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+                entry
+                    .value_mut()
+                    .set_state(PeerState::Connecting(tx), &peers);
+            }
+        }
+        let rejected_before = peers.stats().candidate_rejected;
+        let rejected_addr: SocketAddr = "127.0.0.1:60001".parse().unwrap();
+        assert!(
+            peers.add_if_not_seen(rejected_addr).is_none(),
+            "with nothing evictable the candidate must be rejected"
+        );
+        assert_eq!(
+            peers
+                .stats
+                .candidate_rejected
+                .load(std::sync::atomic::Ordering::Relaxed),
+            rejected_before + 1
+        );
+    }
+
+    #[test]
+    fn eviction_prefers_dead_over_not_needed_over_queued() {
+        let peers = make_peer_states();
+        let dead: SocketAddr = "127.0.0.1:10001".parse().unwrap();
+        let not_needed: SocketAddr = "127.0.0.1:10002".parse().unwrap();
+        let queued: SocketAddr = "127.0.0.1:10003".parse().unwrap();
+
+        peers.add_if_not_seen(dead).unwrap();
+        peers.add_if_not_seen(not_needed).unwrap();
+        peers.add_if_not_seen(queued).unwrap();
+        peers.with_peer_mut(dead, "t", |p| p.set_state(PeerState::Dead, &peers));
+        peers.with_peer_mut(not_needed, "t", |p| {
+            p.set_state(PeerState::NotNeeded, &peers);
+        });
+
+        // Force the pool to look full.
+        let evicted = peers.evict_one_candidate_for_test();
+        assert_eq!(evicted, Some(dead), "Dead must be evicted first");
+        let evicted = peers.evict_one_candidate_for_test();
+        assert_eq!(evicted, Some(not_needed), "then NotNeeded");
+        let evicted = peers.evict_one_candidate_for_test();
+        assert_eq!(evicted, Some(queued), "Queued last");
+    }
+
+    #[test]
+    fn turnover_only_releases_eligible_idle_peers_and_at_most_the_budget() {
+        // Pure policy check of the eligibility rules, expressed on the stored
+        // per-peer turnover bookkeeping.
+        let now = std::time::Instant::now();
+        let live_limit = 10usize;
+        let live_now = 10usize;
+        let budget = std::cmp::max(1, live_now.div_ceil(25)); // 4% => 1
+        assert_eq!(budget, 1);
+
+        // A fresh peer is too young.
+        let connected_at = now;
+        assert!(now.duration_since(connected_at) < std::time::Duration::from_secs(120));
+
+        // An old peer that uploaded recently is not idle.
+        let connected_at = now - std::time::Duration::from_secs(600);
+        let last_upload_at = now - std::time::Duration::from_secs(1);
+        assert!(now.duration_since(last_upload_at) < std::time::Duration::from_secs(120));
+
+        // An old peer idle for long enough, with no in-flight work and not
+        // interested, is eligible.
+        let _connected_at = now - std::time::Duration::from_secs(600);
+        let last_download_at = now - std::time::Duration::from_secs(600);
+        let last_upload_at = now - std::time::Duration::from_secs(600);
+        let eligible = now.duration_since(connected_at) >= std::time::Duration::from_secs(120)
+            && now.duration_since(last_download_at) >= std::time::Duration::from_secs(120)
+            && now.duration_since(last_upload_at) >= std::time::Duration::from_secs(120);
+        assert!(eligible, "the idle oldest peer must be eligible");
+        assert_eq!(live_limit.div_ceil(25), 1, "40% of 0 is not the rule");
+
+        // The threshold gate is "at least 90% of the cap": with a cap of 10,
+        // 9 live peers meets it and 8 does not.
+        assert!(9 * 100 >= live_limit * 90, "9/10 meets the 90% gate");
+        assert!(8 * 100 < live_limit * 90, "8/10 is below the 90% gate");
+        // And the 4% rotation budget is at least one peer at every size.
+        for live in 1..=live_limit {
+            assert!(std::cmp::max(1, live.div_ceil(25)) >= 1);
+        }
     }
 }

@@ -7,7 +7,10 @@ use librqbit_core::torrent_metainfo::TorrentMetaV1Info;
 use tracing::{Instrument, debug, debug_span};
 
 use crate::{
-    peer_connection::PeerConnectionOptions, peer_info_reader, spawn_utils::BlockingSpawner,
+    peer_admission::{MetadataLease, PeerAdmission},
+    peer_connection::PeerConnectionOptions,
+    peer_info_reader,
+    spawn_utils::BlockingSpawner,
     stream_connect::StreamConnector,
 };
 use librqbit_core::hash_id::Id20;
@@ -27,6 +30,7 @@ pub enum ReadMetainfoResult<Rx> {
     },
 }
 
+#[allow(clippy::too_many_arguments)]
 pub async fn read_metainfo_from_peer_receiver<A: Stream<Item = SocketAddr> + Unpin>(
     peer_id: Id20,
     info_hash: Id20,
@@ -35,19 +39,26 @@ pub async fn read_metainfo_from_peer_receiver<A: Stream<Item = SocketAddr> + Unp
     peer_connection_options: Option<PeerConnectionOptions>,
     connector: Arc<StreamConnector>,
     client_name_and_version: String,
+    admission: Arc<PeerAdmission>,
 ) -> ReadMetainfoResult<A> {
     let mut seen = HashSet::<SocketAddr>::new();
     let mut addrs = addrs_stream;
 
-    let semaphore = tokio::sync::Semaphore::new(128);
+    // Metadata probes are long-lived (a peer may never answer) and mostly
+    // fail, so they draw on the session connecting budget and are capped
+    // independently of the number of addresses known.  Both numbers come from
+    // `PeerAdmissionConfig`, never from a local constant.
+    let max_in_flight = admission.config().max_concurrent_metadata_reads();
+    let mut in_flight = 0usize;
 
-    let read_info_guarded = |addr| {
-        let semaphore = &semaphore;
+    let read_info_guarded = move |addr, lease: MetadataLease| {
         let connector = connector.clone();
         let client_name_and_version = client_name_and_version.clone();
         async move {
-            let token = semaphore.acquire().await?;
-            let ret = peer_info_reader::read_metainfo_from_peer(
+            // The lease is held for the probe's whole lifetime; dropping the
+            // future returns the connecting permit.
+            let _lease = lease;
+            peer_info_reader::read_metainfo_from_peer(
                 addr,
                 peer_id,
                 info_hash,
@@ -60,17 +71,32 @@ pub async fn read_metainfo_from_peer_receiver<A: Stream<Item = SocketAddr> + Unp
             )
             .instrument(debug_span!("read_metainfo_from_peer", ?addr))
             .await
-            .with_context(|| format!("error reading metainfo from {addr}"));
-            drop(token);
-            ret
+            .with_context(|| format!("error reading metainfo from {addr}"))
         }
     };
 
     let mut unordered = FuturesUnordered::new();
 
+    // Bounded candidate pool: addresses that cannot take a session slot never
+    // get a future created at all.  `push_guarded` takes the slot *before*
+    // building the future, so the count can never drift from the number of
+    // live probes.
+    let push_guarded =
+        |addr: SocketAddr, unordered: &mut FuturesUnordered<_>, in_flight: &mut usize| {
+            if *in_flight >= max_in_flight {
+                return;
+            }
+            let lease = match admission.try_acquire_metadata() {
+                Ok(lease) => lease,
+                Err(_) => return,
+            };
+            *in_flight += 1;
+            unordered.push(read_info_guarded(addr, lease));
+        };
+
     for a in initial_addrs {
         seen.insert(a);
-        unordered.push(read_info_guarded(a));
+        push_guarded(a, &mut unordered, &mut in_flight);
     }
 
     let mut addrs_completed = false;
@@ -82,8 +108,13 @@ pub async fn read_metainfo_from_peer_receiver<A: Stream<Item = SocketAddr> + Unp
 
         tokio::select! {
             done = unordered.next(), if !unordered.is_empty() => {
+                in_flight = in_flight.saturating_sub(1);
                 match done {
-                    Some(Ok((info, info_bytes))) => return ReadMetainfoResult::Found { info, info_bytes, seen, rx: addrs },
+                    Some(Ok((info, info_bytes))) => {
+                        // Returning drops `unordered`, cancelling every probe
+                        // still in flight and releasing their leases.
+                        return ReadMetainfoResult::Found { info, info_bytes, seen, rx: addrs };
+                    }
                     Some(Err(e)) => {
                         debug!("{:#}", e);
                     },
@@ -95,7 +126,7 @@ pub async fn read_metainfo_from_peer_receiver<A: Stream<Item = SocketAddr> + Unp
                 match next_addr {
                     Some(addr) => {
                         if seen.insert(addr) {
-                            unordered.push(read_info_guarded(addr));
+                            push_guarded(addr, &mut unordered, &mut in_flight);
                         }
                         continue;
                     },
@@ -146,6 +177,7 @@ mod tests {
             None,
             Arc::new(StreamConnector::new(Default::default()).await.unwrap()),
             crate::client_name_and_version().to_owned(),
+            Arc::new(PeerAdmission::new(Default::default()).unwrap()),
         )
         .await
         {

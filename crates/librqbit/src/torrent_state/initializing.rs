@@ -7,6 +7,7 @@ use std::{
 };
 
 use anyhow::Context;
+use librqbit_core::lengths::ValidPieceIndex;
 
 use rand::{RngExt, seq::IteratorRandom};
 use size_format::SizeFormatterBinary as SF;
@@ -100,7 +101,15 @@ impl TorrentStateInitializing {
             return None;
         }
 
-        let is_broken = self
+        // `invalid` is `None` when every sampled piece truly hashes to the
+        // on-disk data, otherwise `Some(reason)` describing the first
+        // contradiction found.  A SHA1 mismatch (`Ok(false)`) is just as
+        // disqualifying as a read error: the have-bitmap claims a piece the
+        // payload does not contain.  Treating a mismatch as success (the
+        // upstream `is_err()`-only check) restores phantom pieces that are
+        // never re-downloaded, leaving zero-filled holes in the "finished"
+        // file.
+        let invalid = self
             .shared
             .spawner
             .block_in_place_with_semaphore(|| {
@@ -145,6 +154,7 @@ impl TorrentStateInitializing {
                 }
 
                 let to_validate_count = to_validate.count_ones();
+                let mut invalid: Option<(ValidPieceIndex, Option<anyhow::Error>)> = None;
                 for (id, piece_id) in to_validate
                     .iter_ones()
                     .filter_map(|id| {
@@ -154,8 +164,18 @@ impl TorrentStateInitializing {
                     })
                     .enumerate()
                 {
-                    if fo.check_piece(piece_id).is_err() {
-                        return true;
+                    // `Ok(false)` is a hash mismatch, not a read error, and is
+                    // just as fatal — see the doc comment above.
+                    match fo.check_piece(piece_id) {
+                        Ok(true) => {}
+                        Ok(false) => {
+                            invalid = Some((piece_id, None));
+                            break;
+                        }
+                        Err(error) => {
+                            invalid = Some((piece_id, Some(error)));
+                            break;
+                        }
                     }
 
                     #[allow(clippy::cast_possible_truncation)]
@@ -166,16 +186,33 @@ impl TorrentStateInitializing {
                     self.checked_bytes.store(progress, Ordering::Relaxed);
                 }
 
-                false
+                invalid
             })
             .await;
 
-        if is_broken {
-            warn!(
-                id = ?self.shared.id,
-                info_hash = ?self.shared.info_hash,
-                "data corrupted, ignoring fastresume data"
-            );
+        if let Some((piece_id, error)) = invalid {
+            let absolute_offset = self.metadata.lengths().piece_offset(piece_id);
+            let piece_length = self.metadata.lengths().piece_length(piece_id);
+            match error {
+                Some(error) => warn!(
+                    id = ?self.shared.id,
+                    info_hash = ?self.shared.info_hash,
+                    piece = piece_id.get(),
+                    piece_length,
+                    absolute_offset,
+                    "fastresume sampling could not verify a piece ({error:#}); \
+                     ignoring fastresume data and doing a full check"
+                ),
+                None => warn!(
+                    id = ?self.shared.id,
+                    info_hash = ?self.shared.info_hash,
+                    piece = piece_id.get(),
+                    piece_length,
+                    absolute_offset,
+                    "fastresume sampling found a piece hash mismatch; \
+                     ignoring fastresume data and doing a full check"
+                ),
+            }
             if let Err(e) = bitv_factory.clear(self.shared.id.into()).await {
                 warn!(id=?self.shared.id, info_hash = ?self.shared.info_hash, "error clearing bitfield: {e:#}");
             }
@@ -293,6 +330,7 @@ impl TorrentStateInitializing {
             .await?;
 
         let paused = TorrentStatePaused {
+            admission: TorrentStatePaused::new_admission(&self.shared),
             shared: self.shared.clone(),
             metadata: self.metadata.clone(),
             files: self.files.take()?,

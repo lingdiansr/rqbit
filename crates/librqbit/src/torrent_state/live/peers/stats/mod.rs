@@ -20,7 +20,8 @@ gen_stats!(AggregatePeerStatsAtomic AggregatePeerStats, [
     seen u32,
     dead u32,
     not_needed u32,
-    steals u32
+    steals u32,
+    candidate_rejected u32
 ], []);
 
 impl AggregatePeerStatsAtomic {

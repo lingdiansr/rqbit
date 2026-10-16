@@ -54,6 +54,14 @@ pub struct DhtStats {
     pub outstanding_requests: usize,
     pub routing_table_size: usize,
     pub routing_table_size_v6: usize,
+    /// Cumulative bootstrap failures, split by cause so an environment
+    /// problem (DNS vs one address family) can be told apart instead of
+    /// surfacing as a single opaque "bootstrap failed".
+    pub bootstrap_dns_failures: u64,
+    pub bootstrap_v4_failures: u64,
+    pub bootstrap_v6_failures: u64,
+    /// Successful bootstraps; a single working family counts as a success.
+    pub bootstrap_successes: u64,
 }
 
 struct OutstandingRequest {
@@ -589,6 +597,12 @@ pub struct DhtState {
 
     cancellation_token: CancellationToken,
 
+    /// Bootstrap outcome counters, see [`DhtStats`].
+    bootstrap_dns_failures: std::sync::atomic::AtomicU64,
+    bootstrap_v4_failures: std::sync::atomic::AtomicU64,
+    bootstrap_v6_failures: std::sync::atomic::AtomicU64,
+    bootstrap_successes: std::sync::atomic::AtomicU64,
+
     pub(crate) peer_store: PeerStore,
 }
 
@@ -615,6 +629,10 @@ impl DhtState {
             rate_limiter: make_rate_limiter(),
             peer_store,
             cancellation_token,
+            bootstrap_dns_failures: std::sync::atomic::AtomicU64::new(0),
+            bootstrap_v4_failures: std::sync::atomic::AtomicU64::new(0),
+            bootstrap_v6_failures: std::sync::atomic::AtomicU64::new(0),
+            bootstrap_successes: std::sync::atomic::AtomicU64::new(0),
         }
     }
 
@@ -929,11 +947,16 @@ impl DhtState {
     }
 
     pub fn get_stats(&self) -> DhtStats {
+        use std::sync::atomic::Ordering;
         DhtStats {
             id: self.id,
             outstanding_requests: self.inflight_by_transaction_id.len(),
             routing_table_size: self.routing_table_v4.read().len(),
             routing_table_size_v6: self.routing_table_v6.read().len(),
+            bootstrap_dns_failures: self.bootstrap_dns_failures.load(Ordering::Relaxed),
+            bootstrap_v4_failures: self.bootstrap_v4_failures.load(Ordering::Relaxed),
+            bootstrap_v6_failures: self.bootstrap_v6_failures.load(Ordering::Relaxed),
+            bootstrap_successes: self.bootstrap_successes.load(Ordering::Relaxed),
         }
     }
 }
@@ -995,10 +1018,17 @@ impl DhtWorker {
     }
 
     async fn bootstrap_hostname(&self, hostname: &str) -> crate::Result<()> {
-        let addrs = tokio::net::lookup_host(hostname)
-            .await
-            .map_err(|err| Error::lookup(hostname, err))?
-            .collect::<Vec<_>>();
+        use std::sync::atomic::Ordering;
+
+        let addrs = match tokio::net::lookup_host(hostname).await {
+            Ok(addrs) => addrs.collect::<Vec<_>>(),
+            Err(err) => {
+                self.dht
+                    .bootstrap_dns_failures
+                    .fetch_add(1, Ordering::Relaxed);
+                return Err(Error::lookup(hostname, err));
+            }
+        };
         let v4 = RecursiveRequest::find_node_for_routing_table(
             self.dht.clone(),
             self.dht.id,
@@ -1014,7 +1044,28 @@ impl DhtWorker {
         .instrument(debug_span!("v6"));
 
         let (v4, v6) = tokio::join!(v4, v6);
-        v4.or(v6)
+        // One working family is a success; only when both fail do we keep the
+        // two root causes apart so the operator can tell DNS from reachability.
+        if v4.is_err() {
+            self.dht
+                .bootstrap_v4_failures
+                .fetch_add(1, Ordering::Relaxed);
+        }
+        if v6.is_err() {
+            self.dht
+                .bootstrap_v6_failures
+                .fetch_add(1, Ordering::Relaxed);
+        }
+        let result = v4.or(v6);
+        if result.is_ok() {
+            self.dht.bootstrap_successes.fetch_add(1, Ordering::Relaxed);
+        } else if let Err(error) = &result {
+            warn!(
+                ?hostname,
+                "dht bootstrap failed for every address family: {error:#}"
+            );
+        }
+        result
     }
 
     async fn bootstrap_hostname_with_backoff(&self, addr: &str) -> crate::Result<()> {
@@ -1484,6 +1535,37 @@ mod tests {
         // Let the bootstrap query reach the closed port and the ICMP error come back.
         tokio::time::sleep(Duration::from_millis(500)).await;
         assert_answers_ping(&dht).await;
+    }
+
+    #[tokio::test]
+    async fn bootstrap_failures_are_attributed_to_dns_and_families() {
+        // An unresolvable bootstrap host is a DNS failure, not a generic
+        // "bootstrap failed": the counters must say which.
+        let dht = DhtState::with_config(DhtConfig {
+            listen_addr: Some((Ipv4Addr::LOCALHOST, 0).into()),
+            bootstrap_addrs: Some(vec!["definitely-not-a-real-host.invalid.:6881".to_string()]),
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+
+        let mut dns_failures = 0;
+        for _ in 0..50 {
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            dns_failures = dht.stats().bootstrap_dns_failures;
+            if dns_failures > 0 {
+                break;
+            }
+        }
+        assert!(
+            dns_failures > 0,
+            "an unresolvable bootstrap hostname must be counted as a DNS failure"
+        );
+        assert_eq!(
+            dht.stats().bootstrap_successes,
+            0,
+            "an unresolvable host cannot be a successful bootstrap"
+        );
     }
 
     // On Windows, a datagram longer than the receive buffer makes recv_from fail with

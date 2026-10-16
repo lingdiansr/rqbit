@@ -154,6 +154,13 @@ pub struct Session {
     _disable_upload: bool,
     pub ipv4_only: bool,
     pub peer_limit: Option<usize>,
+    pub(crate) peer_admission: std::sync::Arc<crate::peer_admission::PeerAdmission>,
+    /// Shared cap on concurrent tracker announces (HTTP + UDP) across every
+    /// torrent in this session.
+    pub(crate) tracker_announce_budget: std::sync::Arc<tokio::sync::Semaphore>,
+    /// Session-wide fair dial scheduler; every live torrent registers as a
+    /// [`crate::peer_admission::DialSource`].
+    pub(crate) dial_scheduler: Arc<crate::peer_admission::DialScheduler>,
     client_name_and_version: String,
     mse_mode: MseMode,
     peer_backoff: Option<crate::PeerBackoffConfig>,
@@ -500,6 +507,9 @@ pub struct SessionOptions {
     /// Backoff config for dead outgoing peers. `None` uses the upstream
     /// defaults (min 10s, factor 6, max 3600s, total 24h).
     pub peer_backoff: Option<crate::PeerBackoffConfig>,
+
+    /// Session-wide peer admission budgets.  See [`crate::PeerAdmissionConfig`].
+    pub peer_admission: crate::PeerAdmissionConfig,
 }
 
 impl Default for SessionOptions {
@@ -530,6 +540,7 @@ impl Default for SessionOptions {
             client_name_and_version: None,
             mse_mode: MseMode::default(),
             peer_backoff: None,
+            peer_admission: crate::PeerAdmissionConfig::default(),
         }
     }
 }
@@ -717,6 +728,17 @@ impl Session {
                 .await
                 .context("error initializing session persistence store")?;
 
+            // Validate the admission budgets up front: a zero budget would
+            // admit no peer at all, and surfacing that at construction is
+            // clearer than silently refusing every connection later.
+            let peer_admission = std::sync::Arc::new(
+                crate::peer_admission::PeerAdmission::new(opts.peer_admission)
+                    .context("invalid peer admission config")?,
+            );
+            let dial_scheduler = std::sync::Arc::new(crate::peer_admission::DialScheduler::new(
+                peer_admission.clone(),
+            ));
+
             let proxy_url = opts.connect.as_ref().and_then(|s| s.proxy_url.as_ref());
             let proxy_config = match proxy_url {
                 Some(pu) => Some(
@@ -832,6 +854,11 @@ impl Session {
                 trackers: opts.trackers,
                 disable_trackers: opts.disable_trackers,
                 peer_limit: opts.peer_limit,
+                peer_admission,
+                tracker_announce_budget: std::sync::Arc::new(tokio::sync::Semaphore::new(
+                    tracker_comms::DEFAULT_TRACKER_ANNOUNCE_CONCURRENCY,
+                )),
+                dial_scheduler,
                 client_name_and_version,
                 mse_mode: opts.mse_mode,
                 peer_backoff: opts.peer_backoff,
@@ -842,6 +869,19 @@ impl Session {
                 allowlist,
                 lsd,
             });
+
+            session.spawn(
+                debug_span!(parent: session.rs(), "dial_scheduler"),
+                "dial_scheduler",
+                {
+                    let scheduler = session.dial_scheduler.clone();
+                    let token = session.cancellation_token.clone();
+                    async move {
+                        scheduler.run(token).await;
+                        Ok(())
+                    }
+                },
+            );
 
             if let Some(mut listen) = listen_result {
                 if let Some(tcp) = listen.tcp_socket.take() {
@@ -936,7 +976,12 @@ impl Session {
         kind: ConnectionKind,
         reader: BoxAsyncReadVectored,
         writer: BoxAsyncWrite,
-    ) -> anyhow::Result<(Arc<TorrentStateLive>, CheckedIncomingConnection)> {
+        lease: crate::peer_admission::PeerConnectionLease,
+    ) -> anyhow::Result<(
+        Arc<TorrentStateLive>,
+        CheckedIncomingConnection,
+        crate::peer_admission::PeerConnectionLease,
+    )> {
         let rwtimeout = self
             .peer_opts
             .read_write_timeout
@@ -970,7 +1015,7 @@ impl Session {
                 .await
                 .context("error reading handshake")?;
             return self
-                .finish_incoming_connection(addr, kind, h, reader, writer, read_buf)
+                .finish_incoming_connection(addr, kind, h, reader, writer, read_buf, lease)
                 .await;
         }
 
@@ -1021,6 +1066,7 @@ impl Session {
                     Box::new(read.into_vectored_compat()),
                     Box::new(write),
                     ReadBuf::new(),
+                    lease,
                 )
                 .await
             }
@@ -1050,12 +1096,14 @@ impl Session {
                     Box::new(read.into_vectored_compat()),
                     Box::new(write),
                     ReadBuf::new(),
+                    lease,
                 )
                 .await
             }
         }
     }
 
+    #[allow(clippy::too_many_arguments)]
     async fn finish_incoming_connection(
         self: Arc<Self>,
         addr: SocketAddr,
@@ -1064,7 +1112,12 @@ impl Session {
         reader: BoxAsyncReadVectored,
         writer: BoxAsyncWrite,
         read_buf: ReadBuf,
-    ) -> anyhow::Result<(Arc<TorrentStateLive>, CheckedIncomingConnection)> {
+        lease: crate::peer_admission::PeerConnectionLease,
+    ) -> anyhow::Result<(
+        Arc<TorrentStateLive>,
+        CheckedIncomingConnection,
+        crate::peer_admission::PeerConnectionLease,
+    )> {
         trace!("received handshake from {addr}: {:?}", h);
 
         if h.peer_id == self.peer_id {
@@ -1095,6 +1148,7 @@ impl Session {
                 handshake: h,
                 read_buf,
             },
+            lease,
         ))
     }
 
@@ -1114,9 +1168,37 @@ impl Session {
                         Ok((addr, (read, write))) => {
                             trace!("accepted connection from {addr}");
                             let session = session.upgrade().context("session is dead")?;
+
+                            // Admission is the primary gate: take the session
+                            // permit before the handshake, so an incoming peer
+                            // that is ultimately refused is dropped here rather
+                            // than after a handshake check.  The
+                            // `max_pending_incoming_handshake_checks` guard on
+                            // this branch is kept as the second line of
+                            // defence, bounding the work in flight when
+                            // admission is generous.
+                            let lease = match session.peer_admission.try_acquire_incoming() {
+                                Ok(lease) => lease,
+                                Err(denied) => {
+                                    debug!(
+                                        ?addr,
+                                        reason = denied.as_str(),
+                                        rejected = session.peer_admission.rejected(),
+                                        "refusing incoming connection: admission denied"
+                                    );
+                                    continue;
+                                }
+                            };
+
                             let span = debug_span!(parent: session.rs(), "incoming", addr=%addr);
                             futs.push(
-                                session.check_incoming_connection(addr, A::KIND, Box::new(read), Box::new(write))
+                                session.check_incoming_connection(
+                                    addr,
+                                    A::KIND,
+                                    Box::new(read),
+                                    Box::new(write),
+                                    lease,
+                                )
                                     .map_err(|e| {
                                         debug!("error checking incoming connection: {e:#}");
                                         e
@@ -1133,9 +1215,9 @@ impl Session {
                         }
                     }
                 },
-                Some(Ok((live, checked))) = futs.next(), if !futs.is_empty() => {
+                Some(Ok((live, checked, lease))) = futs.next(), if !futs.is_empty() => {
                     let (addr, kind) = (checked.addr, checked.kind);
-                    if let Err(e) = live.add_incoming_peer(checked) {
+                    if let Err(e) = live.add_incoming_peer(checked, lease) {
                         warn!(?addr, ?kind, "error handing over incoming connection: {e:#}");
                     }
                 },
@@ -1495,13 +1577,14 @@ impl Session {
                     peer_handshake_timeout: peer_opts.handshake_timeout,
                     mse_mode: self.mse_mode,
                     connect_rate: peer_opts.connect_rate,
-                    peer_backoff: self.peer_backoff.clone(),
+                    peer_backoff: self.peer_backoff,
                     peer_max_request_window: peer_opts.max_request_window,
                     allow_overwrite: opts.overwrite,
                     output_folder,
                     ratelimits: opts.ratelimits,
                     initial_peers: opts.initial_peers.clone().unwrap_or_default(),
                     peer_limit: opts.peer_limit.or(self.peer_limit),
+                    torrent_connect_limit: self.peer_admission.config().torrent_connect_limit,
                     #[cfg(feature = "disable-upload")]
                     _disable_upload: self._disable_upload,
                 },
@@ -1724,6 +1807,8 @@ impl Session {
             self.announce_port().unwrap_or(4240),
             self.reqwest_client.clone(),
             self.udp_tracker_client.clone(),
+            self.tracker_announce_budget.clone(),
+            self.cancellation_token.clone(),
         );
 
         let initial_peers_rx = if initial_peers.is_empty() {
@@ -1794,6 +1879,7 @@ impl Session {
             Some(self.merge_peer_opts(peer_opts)),
             self.connector.clone(),
             self.client_name_and_version.clone(),
+            self.peer_admission.clone(),
         )
         .await
         {

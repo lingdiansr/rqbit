@@ -37,6 +37,39 @@ pub struct TrackerComms {
     announce_port: u16,
     reqwest_client: reqwest::Client,
     key: u32,
+    /// Session-wide cap on concurrent tracker announces.  Held only while a
+    /// single network request (HTTP or UDP) is actually in flight; waiting,
+    /// DNS retries and backoff sleeps never hold it.
+    announce_budget: Arc<tokio::sync::Semaphore>,
+    /// Cancelled when the torrent's tracker stream is dropped.
+    cancel: tokio_util::sync::CancellationToken,
+}
+
+/// Default number of tracker announces allowed to be in flight at once across
+/// the whole session (HTTP and UDP together).
+pub const DEFAULT_TRACKER_ANNOUNCE_CONCURRENCY: usize = 8;
+
+/// Outcome of one successful HTTP announce.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct AnnounceOutcome {
+    /// The interval the tracker announced.
+    pub interval: Duration,
+    /// The tracker's `min_interval` (0 when it did not send one).  An explicit
+    /// forced interval must never undercut this.
+    pub min_interval: Duration,
+}
+
+impl TrackerComms {
+    /// Wait for an announce slot, returning `None` if the torrent is shutting
+    /// down.  The permit is released when the returned guard is dropped, which
+    /// callers must do as soon as the response is fully read.
+    async fn acquire_announce_slot(&self) -> Option<tokio::sync::OwnedSemaphorePermit> {
+        let permit = tokio::select! {
+            _ = self.cancel.cancelled() => return None,
+            permit = Arc::clone(&self.announce_budget).acquire_owned() => permit.ok(),
+        };
+        permit
+    }
 }
 
 #[derive(Default)]
@@ -158,6 +191,8 @@ impl TrackerComms {
         announce_port: u16,
         reqwest_client: reqwest::Client,
         udp_client: UdpTrackerClient,
+        announce_budget: Arc<tokio::sync::Semaphore>,
+        cancel: tokio_util::sync::CancellationToken,
     ) -> Option<BoxStream<'static, SocketAddr>> {
         let trackers = trackers
             .into_iter()
@@ -190,6 +225,8 @@ impl TrackerComms {
                 announce_port,
                 reqwest_client,
                 key: rand::random(),
+                announce_budget,
+                cancel,
             });
             // Each tracker is isolated behind `catch_unwind`: all trackers and
             // (upstream of this stream) DHT/LSD peers are polled from the same
@@ -268,7 +305,7 @@ impl TrackerComms {
         let mut event = Some(tracker_comms_http::TrackerRequestEvent::Started);
 
         loop {
-            let interval = (|| self.tracker_one_request_http(&tracker_url, event))
+            let outcome = (|| self.tracker_one_request_http(&tracker_url, event))
                 .retry(
                     ExponentialBuilder::new()
                         .without_max_times()
@@ -282,7 +319,12 @@ impl TrackerComms {
                 .context("this shouldn't fail")?;
 
             event = None;
-            let interval = self.force_tracker_interval.unwrap_or(interval);
+            // An explicit force interval still may not undercut the tracker's
+            // own minimum.
+            let interval = match self.force_tracker_interval {
+                Some(forced) => forced.max(outcome.min_interval),
+                None => outcome.interval,
+            };
             debug!("sleeping for {:?} after calling tracker", interval);
             tokio::time::sleep(interval).await;
         }
@@ -292,7 +334,14 @@ impl TrackerComms {
         &self,
         tracker_url: &Url,
         event: Option<tracker_comms_http::TrackerRequestEvent>,
-    ) -> anyhow::Result<Duration> {
+    ) -> anyhow::Result<AnnounceOutcome> {
+        // Hold an announce slot across the request AND the body read, then
+        // drop it before peers are handed downstream so a slow consumer cannot
+        // occupy tracker capacity.
+        let _permit = self
+            .acquire_announce_slot()
+            .await
+            .context("tracker announce cancelled")?;
         let stats = self.stats.get();
         let request = tracker_comms_http::TrackerRequest {
             info_hash: &self.info_hash,
@@ -340,12 +389,19 @@ impl TrackerComms {
 
         let peers: Vec<_> = response.iter_peers().collect();
         info!(tracker=%tracker_url, peers=peers.len(), "tracker announce succeeded");
+        // Network work is done; free the announce slot before the (possibly
+        // slow) handoff to the candidate channel.
+        drop(_permit);
         for peer in peers {
             self.tx.send(peer).await?;
         }
-        Ok(Duration::from_secs(
-            response.min_interval.unwrap_or(response.interval),
-        ))
+        // Never re-announce earlier than the tracker allows: both its
+        // announced interval and its min_interval are floors.
+        let min_interval = Duration::from_secs(response.min_interval.unwrap_or(0));
+        Ok(AnnounceOutcome {
+            interval: Duration::from_secs(response.interval).max(min_interval),
+            min_interval,
+        })
     }
 
     async fn task_single_tracker_monitor_udp(
@@ -426,6 +482,11 @@ impl TrackerComms {
     ) -> anyhow::Result<Duration> {
         use tracker_comms_udp::*;
 
+        let _permit = self
+            .acquire_announce_slot()
+            .await
+            .context("tracker announce cancelled")?;
+
         let stats = self.stats.get();
         let request = AnnounceFields {
             info_hash: self.info_hash,
@@ -464,5 +525,78 @@ impl TrackerComms {
                 Err(e)
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    /// Every tracker must eventually get its announce served, including the
+    /// 9th and later: the monitors all run, and only the network request is
+    /// serialised by the budget.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn all_trackers_beyond_the_budget_are_served() {
+        const TRACKERS: usize = 20;
+        const BUDGET: usize = 8;
+
+        let served = std::sync::Arc::new(AtomicUsize::new(0));
+        let budget = std::sync::Arc::new(tokio::sync::Semaphore::new(BUDGET));
+        let cancel = tokio_util::sync::CancellationToken::new();
+
+        // Model each tracker's network work: bounded by the shared budget.
+        let mut tasks = Vec::new();
+        for _ in 0..TRACKERS {
+            let budget = budget.clone();
+            let served = served.clone();
+            let cancel = cancel.clone();
+            tasks.push(tokio::spawn(async move {
+                let _permit = tokio::select! {
+                    _ = cancel.cancelled() => return,
+                    p = tokio::time::timeout(
+                        Duration::from_secs(5),
+                        budget.acquire(),
+                    ) => p.expect("must not starve").expect("semaphore open"),
+                };
+                served.fetch_add(1, Ordering::Relaxed);
+            }));
+        }
+        for t in tasks {
+            t.await.expect("task");
+        }
+        assert_eq!(
+            served.load(Ordering::Relaxed),
+            TRACKERS,
+            "every tracker, including those past the budget, must be served"
+        );
+    }
+
+    #[test]
+    fn announce_interval_never_undercuts_min_interval() {
+        let outcome = AnnounceOutcome {
+            interval: Duration::from_secs(60).max(Duration::from_secs(300)),
+            min_interval: Duration::from_secs(300),
+        };
+        assert_eq!(outcome.interval, Duration::from_secs(300));
+
+        let outcome = AnnounceOutcome {
+            interval: Duration::from_secs(600).max(Duration::from_secs(300)),
+            min_interval: Duration::from_secs(300),
+        };
+        assert_eq!(outcome.interval, Duration::from_secs(600));
+
+        // A forced interval below the tracker minimum is raised to it.
+        let forced = Duration::from_secs(30);
+        assert_eq!(
+            forced.max(Duration::from_secs(300)),
+            Duration::from_secs(300)
+        );
+        // ...but a forced interval above it is respected.
+        let forced = Duration::from_secs(900);
+        assert_eq!(
+            forced.max(Duration::from_secs(300)),
+            Duration::from_secs(900)
+        );
     }
 }
