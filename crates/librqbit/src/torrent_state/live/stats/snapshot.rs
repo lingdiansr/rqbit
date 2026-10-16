@@ -20,6 +20,12 @@ pub struct StatsSnapshot {
 
     pub downloaded_and_checked_pieces: u64,
     pub total_piece_download_ms: u64,
+    /// Accepted, valid upload requests, cumulative for this live instance.
+    pub upload_requests: u64,
+    /// Upload requests enqueued but not yet handed to the writer.
+    pub upload_queue_depth: u32,
+    /// Live peers that took payload from us within the recent-activity window.
+    pub uploading_peers: u32,
     pub peer_stats: AggregatePeerStats,
 }
 

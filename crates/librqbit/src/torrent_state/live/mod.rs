@@ -1065,6 +1065,9 @@ impl TorrentStateLive {
             uploaded_bytes: self.stats.uploaded_bytes.load(Relaxed),
             live_epoch: self.live_epoch,
             total_piece_download_ms: self.stats.total_piece_download_ms.load(Relaxed),
+            upload_requests: self.stats.upload_requests.load(Relaxed),
+            upload_queue_depth: self.stats.upload_queue_depth.load(Relaxed),
+            uploading_peers: self.stats.uploading_peers.load(Relaxed),
             peer_stats: self.peers.stats(),
         }
     }
