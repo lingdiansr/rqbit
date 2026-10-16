@@ -328,6 +328,7 @@ mod tests {
 
     use super::*;
     use crate::stream_connect::ConnectionKind;
+    use std::time::Duration;
 
     const TOTAL_PIECES: usize = 8;
 
@@ -640,42 +641,74 @@ mod tests {
     }
 
     #[test]
-    fn turnover_only_releases_eligible_idle_peers_and_at_most_the_budget() {
-        // Pure policy check of the eligibility rules, expressed on the stored
-        // per-peer turnover bookkeeping.
+    fn turnover_releases_only_stalled_peers() {
+        use super::super::{
+            TURNOVER_INTERVAL, TURNOVER_MIN_IDLE, TURNOVER_MIN_PEER_AGE, turnover_eligible,
+        };
         let now = std::time::Instant::now();
-        let live_limit = 10usize;
-        let live_now = 10usize;
-        let budget = std::cmp::max(1, live_now.div_ceil(25)); // 4% => 1
-        assert_eq!(budget, 1);
+        let long_ago = now - Duration::from_secs(3600);
+        // A peer connected long ago and silent in both directions is the case
+        // turnover exists for: it holds a slot a fresh candidate could use.
+        let stale = |connected, down, up, inflight, interested| {
+            turnover_eligible(now, connected, down, up, inflight, interested)
+        };
 
-        // A fresh peer is too young.
-        let connected_at = now;
-        assert!(now.duration_since(connected_at) < std::time::Duration::from_secs(120));
+        assert!(
+            stale(long_ago, long_ago, long_ago, 0, false),
+            "a long-connected, fully idle, uninterested peer must be rotatable"
+        );
 
-        // An old peer that uploaded recently is not idle.
-        let connected_at = now - std::time::Duration::from_secs(600);
-        let last_upload_at = now - std::time::Duration::from_secs(1);
-        assert!(now.duration_since(last_upload_at) < std::time::Duration::from_secs(120));
+        // The age floor, checked on both sides of its value.
+        assert!(
+            !stale(now, long_ago, long_ago, 0, false),
+            "a peer younger than TURNOVER_MIN_PEER_AGE must be kept"
+        );
+        assert!(
+            stale(now - TURNOVER_MIN_PEER_AGE, long_ago, long_ago, 0, false),
+            "a peer exactly at TURNOVER_MIN_PEER_AGE is old enough"
+        );
 
-        // An old peer idle for long enough, with no in-flight work and not
-        // interested, is eligible.
-        let _connected_at = now - std::time::Duration::from_secs(600);
-        let last_download_at = now - std::time::Duration::from_secs(600);
-        let last_upload_at = now - std::time::Duration::from_secs(600);
-        let eligible = now.duration_since(connected_at) >= std::time::Duration::from_secs(120)
-            && now.duration_since(last_download_at) >= std::time::Duration::from_secs(120)
-            && now.duration_since(last_upload_at) >= std::time::Duration::from_secs(120);
-        assert!(eligible, "the idle oldest peer must be eligible");
-        assert_eq!(live_limit.div_ceil(25), 1, "40% of 0 is not the rule");
+        // Recent payload in either direction is a hard keep, both sides.
+        assert!(
+            !stale(long_ago, now, long_ago, 0, false),
+            "a peer that just downloaded from us is not idle"
+        );
+        assert!(
+            !stale(long_ago, long_ago, now, 0, false),
+            "a peer we just uploaded to is not idle"
+        );
+        assert!(
+            stale(
+                long_ago,
+                now - TURNOVER_MIN_IDLE,
+                now - TURNOVER_MIN_IDLE,
+                0,
+                false
+            ),
+            "a peer exactly at TURNOVER_MIN_IDLE is idle enough"
+        );
 
-        // The threshold gate is "at least 90% of the cap": with a cap of 10,
-        // 9 live peers meets it and 8 does not.
-        assert!(9 * 100 >= live_limit * 90, "9/10 meets the 90% gate");
-        assert!(8 * 100 < live_limit * 90, "8/10 is below the 90% gate");
-        // And the 4% rotation budget is at least one peer at every size.
-        for live in 1..=live_limit {
-            assert!(std::cmp::max(1, live.div_ceil(25)) >= 1);
+        // In-flight work and real demand both veto rotation.
+        assert!(
+            !stale(long_ago, long_ago, long_ago, 1, false),
+            "a peer with requests in flight must be left alone"
+        );
+        assert!(
+            !stale(long_ago, long_ago, long_ago, 0, true),
+            "a peer that is interested in our data is demand, not idleness"
+        );
+
+        // Every timing bound the policy promises to hold within a minute.
+        assert!(TURNOVER_MIN_PEER_AGE <= Duration::from_secs(60));
+        assert!(TURNOVER_MIN_IDLE <= Duration::from_secs(60));
+        assert!(TURNOVER_INTERVAL <= Duration::from_secs(60));
+
+        // The rotation budget is at least one peer at every size, and stays a
+        // small fraction so a single pass cannot empty the swarm.
+        for live in 1..=512usize {
+            let budget = std::cmp::max(1, live.div_ceil(25));
+            assert!(budget >= 1);
+            assert!(budget <= std::cmp::max(1, live / 25 + 1));
         }
     }
 }

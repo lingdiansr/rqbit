@@ -248,13 +248,58 @@ pub struct TorrentStateLive {
 /// the candidate queue and the per-torrent budgets, and it starts outgoing
 /// peer tasks for the addresses the scheduler admits.
 /// A peer must have been connected this long before it may be rotated out.
-const TURNOVER_MIN_PEER_AGE: Duration = Duration::from_secs(120);
+///
+/// Kept short so a candidate that never produces anything is cycled out within
+/// the first minute of its life instead of occupying a slot for two.
+pub(crate) const TURNOVER_MIN_PEER_AGE: Duration = Duration::from_secs(30);
 /// A peer must have been idle (no payload either way) for this long.
-const TURNOVER_MIN_IDLE: Duration = Duration::from_secs(120);
+///
+/// This is the guard that keeps a *useful* peer safe: anything still moving
+/// payload in either direction stays.  Only peers that have gone quiet are
+/// candidates for replacement.
+pub(crate) const TURNOVER_MIN_IDLE: Duration = Duration::from_secs(30);
 /// How often turnover may run at all.
-const TURNOVER_INTERVAL: Duration = Duration::from_secs(300);
+///
+/// One minute, so a torrent that is collecting stalled peers sheds them at a
+/// steady rate rather than in one large batch.
+pub(crate) const TURNOVER_INTERVAL: Duration = Duration::from_secs(60);
 /// Turnover only engages once live usage reaches this fraction of the cap.
-const TURNOVER_LIVE_THRESHOLD_PERCENT: usize = 90;
+///
+/// Deliberately well below full: an idle peer is worth replacing before the
+/// pool is exhausted, because the slot it holds is what a fresh candidate
+/// would otherwise get.  Still a floor rather than zero, so a small swarm is
+/// not churned.
+pub(crate) const TURNOVER_LIVE_THRESHOLD_PERCENT: usize = 50;
+
+/// Whether a live peer may be rotated out in favour of a queued candidate.
+///
+/// Pure so the policy is testable without a running torrent: the caller
+/// supplies `now` and the peer's stored activity timestamps.
+fn turnover_eligible(
+    now: Instant,
+    connected_at: Instant,
+    last_download_at: Instant,
+    last_upload_at: Instant,
+    requested_inflight: usize,
+    peer_interested: bool,
+) -> bool {
+    if now.duration_since(connected_at) < TURNOVER_MIN_PEER_AGE {
+        return false;
+    }
+    // Any recent payload in either direction makes this peer useful, not idle.
+    if now.duration_since(last_download_at) < TURNOVER_MIN_IDLE
+        || now.duration_since(last_upload_at) < TURNOVER_MIN_IDLE
+    {
+        return false;
+    }
+    // Still has work in flight with us.
+    if requested_inflight > 0 {
+        return false;
+    }
+    // `peer_interested` means the peer wants data from us — real demand, not
+    // idleness.
+    !peer_interested
+}
 
 impl TorrentStateLive {
     /// Conservative peer turnover.
@@ -321,21 +366,14 @@ impl TorrentStateLive {
             let Some(live) = peer.get_live() else {
                 continue;
             };
-            if now.duration_since(live.connected_at) < TURNOVER_MIN_PEER_AGE {
-                continue;
-            }
-            if now.duration_since(live.last_download_at) < TURNOVER_MIN_IDLE
-                || now.duration_since(live.last_upload_at) < TURNOVER_MIN_IDLE
-            {
-                continue;
-            }
-            // Still has work in flight with us: leave it alone.
-            if live.requested_inflight_count() > 0 {
-                continue;
-            }
-            // `peer_interested` means the peer wants data from us — that is
-            // real demand, not idleness.
-            if live.peer_interested {
+            if !turnover_eligible(
+                now,
+                live.connected_at,
+                live.last_download_at,
+                live.last_upload_at,
+                live.requested_inflight_count(),
+                live.peer_interested,
+            ) {
                 continue;
             }
             eligible.push(*entry.key());
