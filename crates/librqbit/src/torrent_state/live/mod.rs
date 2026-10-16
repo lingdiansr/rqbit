@@ -364,6 +364,55 @@ fn next_live_epoch() -> u64 {
     NEXT.fetch_add(1, Ordering::Relaxed)
 }
 
+/// How recently a live peer must have taken payload from us to count as
+/// currently uploading.
+const UPLOADING_PEER_WINDOW: Duration = Duration::from_secs(10);
+
+impl TorrentStateLive {
+    /// Republish the outstanding-request count as a plain atomic.
+    ///
+    /// The queue is behind a mutex; the statistic is read from contexts that
+    /// must not take it (session aggregate snapshots), so the depth is
+    /// published at the few points the queue changes.
+    fn publish_upload_queue_depth(&self) {
+        // The per-torrent queue cap keeps this far below u32::MAX; the cast is
+        // a narrowing of an already-bounded backlog, not a data loss path.
+        #[allow(clippy::cast_possible_truncation)]
+        let depth = self
+            .upload_queue
+            .lock()
+            .map(|q| q.total_pending() as u32)
+            .unwrap_or(0);
+        self.stats
+            .upload_queue_depth
+            .store(depth, Ordering::Relaxed);
+    }
+
+    /// Republish how many live peers are currently taking payload from us.
+    ///
+    /// Counted from the per-peer activity timestamps the turnover policy
+    /// already maintains, so no extra bookkeeping is needed; the scan is over
+    /// connected peers only and runs on the existing maintenance tick.
+    fn publish_uploading_peers(&self) {
+        let now = std::time::Instant::now();
+        // Peer counts are bounded by the admission budgets, never near u32.
+        #[allow(clippy::cast_possible_truncation)]
+        let uploading = self
+            .peers
+            .states
+            .iter()
+            .filter(|entry| {
+                entry.value().get_live().is_some_and(|live| {
+                    now.duration_since(live.last_upload_at) < UPLOADING_PEER_WINDOW
+                })
+            })
+            .count() as u32;
+        self.stats
+            .uploading_peers
+            .store(uploading, Ordering::Relaxed);
+    }
+}
+
 impl DialSource for TorrentStateLive {
     fn admission(&self) -> Arc<TorrentAdmission> {
         self.admission.clone()
@@ -400,6 +449,11 @@ impl DialSource for TorrentStateLive {
     }
 
     fn release_idle_peers(&self) -> usize {
+        // Cheap, already-scheduled point to refresh the upload statistics:
+        // the scheduler calls this on its periodic pass, so no extra timer or
+        // disk work is introduced.
+        self.publish_uploading_peers();
+        self.publish_upload_queue_depth();
         self.maybe_turnover_peers()
     }
 
@@ -669,6 +723,7 @@ impl TorrentStateLive {
                 self.upload_notify.notified().await;
                 continue;
             };
+            self.publish_upload_queue_depth();
 
             // Resolve the peer's writer channel.  If the peer is gone the
             // request simply disappears with it.
@@ -1484,7 +1539,6 @@ impl PeerConnectionHandler for &'_ PeerHandler {
             .uploaded_bytes
             .fetch_add(bytes as u64, Ordering::Relaxed);
     }
-
     fn read_chunk(&self, chunk: &ChunkInfo, buf: &mut [u8]) -> anyhow::Result<()> {
         self.state.file_ops().read_chunk(self.addr, chunk, buf)
     }
@@ -1889,6 +1943,11 @@ impl PeerHandler {
         };
         match outcome {
             upload_queue::EnqueueOutcome::Queued => {
+                self.state
+                    .stats
+                    .upload_requests
+                    .fetch_add(1, Ordering::Relaxed);
+                self.state.publish_upload_queue_depth();
                 self.state.upload_notify.notify_one();
                 Ok(())
             }
@@ -1921,9 +1980,9 @@ impl PeerHandler {
                 trace!(peer = %self.addr, dropped, "dropped pending uploads after NotInterested");
             }
         }
+        self.state.publish_upload_queue_depth();
         Ok(())
     }
-
     /// The peer cancelled a request it made.  Only a request that has not been
     /// handed to the writer yet can be removed; one already being written is
     /// allowed to finish.

@@ -21,7 +21,18 @@ gen_stats!(AggregatePeerStatsAtomic AggregatePeerStats, [
     dead u32,
     not_needed u32,
     steals u32,
-    candidate_rejected u32
+    candidate_rejected u32,
+    // Peers that sent `Interested`: real demand for our data. Maintained by
+    // the Interested/NotInterested edges and by disconnect, so it can be read
+    // without walking per-peer state.
+    interested_peers u32,
+    // Inbound connections turned away before any BT handshake. Session-scoped:
+    // the session-level aggregate is the meaningful one; per-torrent readers
+    // see the counters of the session that recorded them.
+    incoming_rejected u32,
+    // Connections refused by the session admission budgets (session-scoped,
+    // like `incoming_rejected`).
+    admission_rejected u32
 ], []);
 
 impl AggregatePeerStatsAtomic {

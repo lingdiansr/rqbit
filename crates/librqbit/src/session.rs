@@ -996,6 +996,7 @@ impl Session {
                 .counters
                 .blocked_incoming
                 .fetch_add(1, Ordering::Relaxed);
+            crate::torrent_state::utils::atomic_inc(&self.stats.peers.incoming_rejected);
             bail!("Incoming ip {incoming_ip} is in blocklist");
         }
         if self.allowlist.as_ref().is_some_and(|l| !l.has(incoming_ip)) {
@@ -1003,6 +1004,7 @@ impl Session {
                 .counters
                 .blocked_incoming
                 .fetch_add(1, Ordering::Relaxed);
+            crate::torrent_state::utils::atomic_inc(&self.stats.peers.incoming_rejected);
             bail!("Incoming ip {incoming_ip} is not in allowlist");
         }
 
@@ -1180,6 +1182,9 @@ impl Session {
                             let lease = match session.peer_admission.try_acquire_incoming() {
                                 Ok(lease) => lease,
                                 Err(denied) => {
+                                    crate::torrent_state::utils::atomic_inc(
+                                        &session.stats.peers.admission_rejected,
+                                    );
                                     debug!(
                                         ?addr,
                                         reason = denied.as_str(),

@@ -188,6 +188,14 @@ impl PeerStates {
     pub fn drop_peer(&self, handle: PeerHandle) -> Option<Peer> {
         let p = self.states.remove(&handle).map(|r| r.1)?;
         let s = p.get_state();
+        // A disconnected peer stops being a demand signal. Interest is
+        // decremented here rather than from the protocol edge because a
+        // disconnecting peer never gets to send `NotInterested`.
+        if let PeerState::Live(live) = &s
+            && live.peer_interested
+        {
+            crate::torrent_state::utils::atomic_dec(&self.stats.interested_peers);
+        }
         self.stats.dec(s);
         self.session_stats.dec(s);
 
@@ -206,11 +214,25 @@ impl PeerStates {
     }
 
     pub fn mark_peer_interested(&self, handle: PeerHandle, is_interested: bool) -> Option<bool> {
-        self.with_live_mut(handle, "mark_peer_interested", |live| {
+        let changed = self.with_live_mut(handle, "mark_peer_interested", |live| {
             let prev = live.peer_interested;
             live.peer_interested = is_interested;
             prev
-        })
+        });
+        // Interest is read as an aggregate (see `interested_peers`); maintain
+        // it here so every transition — interested, not-interested and
+        // disconnect — goes through one edge rather than three call sites.
+        if let Some(prev) = changed
+            && prev != is_interested
+        {
+            let counter = &self.stats.interested_peers;
+            if is_interested {
+                crate::torrent_state::utils::atomic_inc(counter);
+            } else {
+                crate::torrent_state::utils::atomic_dec(counter);
+            }
+        }
+        changed
     }
 
     pub fn update_bitfield(
