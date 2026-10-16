@@ -856,6 +856,12 @@ impl TorrentStateLive {
             .peers
             .with_peer(addr, |p| p.stats.counters.clone())
             .ok_or(Error::BugPeerNotFound)?;
+        // Counted here rather than after the handler is built: `state` is moved
+        // into the handler below, and the aggregate belongs to the same event.
+        state
+            .stats
+            .connection_attempts
+            .fetch_add(1, Ordering::Relaxed);
 
         let handler = PeerHandler {
             addr,
@@ -1068,6 +1074,10 @@ impl TorrentStateLive {
             upload_requests: self.stats.upload_requests.load(Relaxed),
             upload_queue_depth: self.stats.upload_queue_depth.load(Relaxed),
             uploading_peers: self.stats.uploading_peers.load(Relaxed),
+            connection_attempts: self.stats.connection_attempts.load(Relaxed),
+            connection_successes: self.stats.connection_successes.load(Relaxed),
+            connection_errors: self.stats.connection_errors.load(Relaxed),
+            total_connecting_ms: self.stats.total_connecting_ms.load(Relaxed),
             peer_stats: self.peers.stats(),
         }
     }
@@ -1393,9 +1403,18 @@ impl PeerConnectionHandler for &'_ PeerHandler {
             .outgoing_connections
             .fetch_add(1, Ordering::Relaxed);
         #[allow(clippy::cast_possible_truncation)]
+        let connecting_ms = connection_time.as_millis() as u64;
         self.counters
             .total_time_connecting_ms
-            .fetch_add(connection_time.as_millis() as u64, Ordering::Relaxed);
+            .fetch_add(connecting_ms, Ordering::Relaxed);
+        self.state
+            .stats
+            .connection_successes
+            .fetch_add(1, Ordering::Relaxed);
+        self.state
+            .stats
+            .total_connecting_ms
+            .fetch_add(connecting_ms, Ordering::Relaxed);
     }
 
     async fn on_received_message(&self, message: Message<'_>) -> anyhow::Result<()> {
@@ -1732,6 +1751,10 @@ impl PeerHandler {
         };
 
         self.counters.errors.fetch_add(1, Ordering::Relaxed);
+        self.state
+            .stats
+            .connection_errors
+            .fetch_add(1, Ordering::Relaxed);
 
         if self.state.is_finished_and_no_active_streams() {
             debug!("torrent finished, not re-queueing");
@@ -2274,10 +2297,21 @@ impl PeerHandler {
         };
 
         // Peer chunk/byte counters.
-        self.counters
+        let before = self
+            .counters
             .fetched_bytes
             .fetch_add(piece.len() as u64, Ordering::Relaxed);
         self.counters.fetched_chunks.fetch_add(1, Ordering::Relaxed);
+        // `before` is the pre-add value, so the aggregate counts each peer once,
+        // at the moment it first crosses the usefulness threshold.
+        if before < peer::stats::atomic::USEFUL_PEER_BYTES
+            && before + piece.len() as u64 >= peer::stats::atomic::USEFUL_PEER_BYTES
+        {
+            self.state
+                .stats
+                .useful_peers
+                .fetch_add(1, Ordering::Relaxed);
+        }
         // Turnover eligibility: this peer just sent us payload.
         self.state
             .peers

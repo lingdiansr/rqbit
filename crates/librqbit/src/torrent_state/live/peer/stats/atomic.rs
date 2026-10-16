@@ -8,6 +8,14 @@ use std::{
 
 use backon::{BackoffBuilder, ExponentialBackoff, ExponentialBuilder};
 
+/// Payload a peer must have taken from us to count as useful for the torrent.
+///
+/// Named here because the aggregate in
+/// [`crate::torrent_state::live::stats::AtomicStats`] is maintained at the same
+/// points the per-peer counter moves; consumers read the aggregate instead of
+/// summing per-peer records.
+pub(crate) const USEFUL_PEER_BYTES: u64 = 1024 * 1024;
+
 #[derive(Default, Debug)]
 pub(crate) struct PeerCountersAtomic {
     pub fetched_bytes: AtomicU64,

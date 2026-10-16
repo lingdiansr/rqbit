@@ -26,6 +26,12 @@ pub struct StatsSnapshot {
     pub upload_queue_depth: u32,
     /// Live peers that took payload from us within the recent-activity window.
     pub uploading_peers: u32,
+    /// Outbound connection attempts / established connections / errors, and
+    /// the time spent connecting, summed across every peer record.
+    pub connection_attempts: u64,
+    pub connection_successes: u64,
+    pub connection_errors: u64,
+    pub total_connecting_ms: u64,
     pub peer_stats: AggregatePeerStats,
 }
 

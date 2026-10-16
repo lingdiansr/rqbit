@@ -26,6 +26,11 @@ gen_stats!(AggregatePeerStatsAtomic AggregatePeerStats, [
     // the Interested/NotInterested edges and by disconnect, so it can be read
     // without walking per-peer state.
     interested_peers u32,
+    // Peers that have taken at least `peer::stats::atomic::USEFUL_PEER_BYTES`
+    // from us. Incremented when a peer first crosses the threshold and
+    // decremented when such a peer disconnects, so a reader never has to walk
+    // and sum per-peer counters.
+    useful_peers u32,
     // Inbound connections turned away before any BT handshake. Session-scoped:
     // the session-level aggregate is the meaningful one; per-torrent readers
     // see the counters of the session that recorded them.

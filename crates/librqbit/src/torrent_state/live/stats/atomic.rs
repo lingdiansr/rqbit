@@ -14,4 +14,15 @@ pub struct AtomicStats {
     pub upload_queue_depth: AtomicU32,
     /// Live peers that took payload from us within the recent-activity window.
     pub uploading_peers: AtomicU32,
+    /// Peers that have fetched at least `USEFUL_PEER_BYTES` from us. Maintained
+    /// incrementally so a reader never has to walk and sum per-peer counters.
+    pub useful_peers: AtomicU32,
+    /// Outbound connection attempts across every peer record.
+    pub connection_attempts: AtomicU64,
+    /// Established outbound connections across every peer record.
+    pub connection_successes: AtomicU64,
+    /// Connection errors recorded on peer records.
+    pub connection_errors: AtomicU64,
+    /// Time spent connecting, summed across peer records.
+    pub total_connecting_ms: AtomicU64,
 }

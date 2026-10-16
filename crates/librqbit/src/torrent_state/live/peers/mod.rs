@@ -1,4 +1,4 @@
-use std::{collections::HashSet, net::SocketAddr, sync::Arc};
+use std::{collections::HashSet, net::SocketAddr, sync::Arc, sync::atomic::Ordering};
 
 use dashmap::DashMap;
 use librqbit_core::lengths::ValidPieceIndex;
@@ -188,13 +188,21 @@ impl PeerStates {
     pub fn drop_peer(&self, handle: PeerHandle) -> Option<Peer> {
         let p = self.states.remove(&handle).map(|r| r.1)?;
         let s = p.get_state();
-        // A disconnected peer stops being a demand signal. Interest is
+        // A peer that leaves stops being a demand signal. Interest is
         // decremented here rather than from the protocol edge because a
         // disconnecting peer never gets to send `NotInterested`.
         if let PeerState::Live(live) = &s
             && live.peer_interested
         {
             crate::torrent_state::utils::atomic_dec(&self.stats.interested_peers);
+        }
+        // A departed peer stops counting as useful; without this the aggregate
+        // would drift upward forever. Read from the removed record, which is
+        // the last observation of its lifetime.
+        if p.stats.counters.fetched_bytes.load(Ordering::Relaxed)
+            >= crate::torrent_state::live::peer::stats::atomic::USEFUL_PEER_BYTES
+        {
+            crate::torrent_state::utils::atomic_dec(&self.stats.useful_peers);
         }
         self.stats.dec(s);
         self.session_stats.dec(s);
