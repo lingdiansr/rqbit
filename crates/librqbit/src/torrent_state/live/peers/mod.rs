@@ -6,6 +6,7 @@ use parking_lot::RwLock;
 
 use crate::{
     Error,
+    torrent_state::live::peer::stats::atomic::USEFUL_PEER_BYTES,
     torrent_state::utils::{TimedExistence, atomic_inc},
     type_aliases::{BF, PeerHandle},
 };
@@ -188,20 +189,12 @@ impl PeerStates {
     pub fn drop_peer(&self, handle: PeerHandle) -> Option<Peer> {
         let p = self.states.remove(&handle).map(|r| r.1)?;
         let s = p.get_state();
-        // A peer that leaves stops being a demand signal. Interest is
-        // decremented here rather than from the protocol edge because a
-        // disconnecting peer never gets to send `NotInterested`.
-        if let PeerState::Live(live) = &s
-            && live.peer_interested
-        {
-            crate::torrent_state::utils::atomic_dec(&self.stats.interested_peers);
-        }
         // A departed peer stops counting as useful; without this the aggregate
         // would drift upward forever. Read from the removed record, which is
-        // the last observation of its lifetime.
-        if p.stats.counters.fetched_bytes.load(Ordering::Relaxed)
-            >= crate::torrent_state::live::peer::stats::atomic::USEFUL_PEER_BYTES
-        {
+        // the last observation of its lifetime. (Interest is part of the peer
+        // state, so `dec` below already un-counts it — doing it here too would
+        // underflow the counter.)
+        if p.stats.counters.fetched_bytes.load(Ordering::Relaxed) >= USEFUL_PEER_BYTES {
             crate::torrent_state::utils::atomic_dec(&self.stats.useful_peers);
         }
         self.stats.dec(s);
@@ -219,6 +212,23 @@ impl PeerStates {
             !live.peer_interested && live.has_full_torrent(total_pieces)
         })
         .unwrap_or(false)
+    }
+
+    /// Account payload this peer fetched from us, maintaining the
+    /// `useful_peers` aggregate.
+    ///
+    /// Lives here rather than in the message handler so the "a peer becomes
+    /// useful exactly once, when it first crosses the threshold" rule has a
+    /// single home that a unit test can drive.
+    pub(crate) fn note_peer_fetched_bytes(
+        &self,
+        counters: &super::peer::stats::atomic::PeerCountersAtomic,
+        len: u64,
+    ) {
+        let before = counters.fetched_bytes.fetch_add(len, Ordering::Relaxed);
+        if before < USEFUL_PEER_BYTES && before + len >= USEFUL_PEER_BYTES {
+            atomic_inc(&self.stats.useful_peers);
+        }
     }
 
     pub fn mark_peer_interested(&self, handle: PeerHandle, is_interested: bool) -> Option<bool> {
@@ -359,6 +369,65 @@ mod tests {
             peers.stats().live_seeders,
             peers.session_stats.snapshot().live_seeders,
         )
+    }
+
+    /// Usefulness is an aggregate: it must count each peer once when it crosses
+    /// the threshold, and stop counting it when it leaves.
+    #[test]
+    fn useful_peers_counts_each_peer_once_and_decrements_on_disconnect() {
+        let peers = make_peer_states();
+        let (addr, _rx) = add_live_peer(&peers, "127.0.0.1:7000");
+        let counters = peers
+            .with_peer(addr, |p| p.stats.counters.clone())
+            .expect("peer counters");
+
+        assert_eq!(peers.stats().useful_peers, 0);
+        // Below the threshold: still not useful.
+        peers.note_peer_fetched_bytes(&counters, USEFUL_PEER_BYTES - 1);
+        assert_eq!(peers.stats().useful_peers, 0);
+        // Crossing it counts exactly one peer.
+        peers.note_peer_fetched_bytes(&counters, 1);
+        assert_eq!(peers.stats().useful_peers, 1);
+        // Further payload does not count the same peer twice.
+        peers.note_peer_fetched_bytes(&counters, 10_000);
+        assert_eq!(peers.stats().useful_peers, 1);
+
+        // A second, non-useful peer must not change the aggregate.
+        let (other, _rx2) = add_live_peer(&peers, "127.0.0.1:7001");
+        assert_eq!(peers.stats().useful_peers, 1);
+
+        // The useful peer leaving releases its slot in the aggregate.
+        peers.drop_peer(addr);
+        assert_eq!(peers.stats().useful_peers, 0);
+        // The non-useful one leaving changes nothing.
+        peers.drop_peer(other);
+        assert_eq!(peers.stats().useful_peers, 0);
+    }
+
+    /// Interest is an aggregate over the live edge, so it must move on both
+    /// the `Interested` / `NotInterested` transitions and on disconnect.
+    #[test]
+    fn interested_peers_tracks_interest_and_disconnect() {
+        let peers = make_peer_states();
+        let (addr, _rx) = add_live_peer(&peers, "127.0.0.1:7100");
+        // A connection is created interested, so joining already counts it.
+        assert_eq!(peers.stats().interested_peers, 1);
+
+        peers.mark_peer_interested(addr, true).expect("mark again");
+        assert_eq!(peers.stats().interested_peers, 1);
+        // Repeating the same state must not double count.
+        peers.mark_peer_interested(addr, true).expect("mark again");
+        assert_eq!(peers.stats().interested_peers, 1);
+
+        peers.mark_peer_interested(addr, false).expect("clear");
+        assert_eq!(peers.stats().interested_peers, 0);
+
+        // A peer that disconnects while interested is un-counted even though it
+        // never sent `NotInterested`.
+        peers.mark_peer_interested(addr, true).expect("re-mark");
+        assert_eq!(peers.stats().interested_peers, 1);
+        peers.drop_peer(addr);
+        assert_eq!(peers.stats().interested_peers, 0);
     }
 
     #[test]

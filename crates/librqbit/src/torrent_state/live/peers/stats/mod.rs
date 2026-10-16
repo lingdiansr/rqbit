@@ -65,6 +65,13 @@ impl AggregatePeerStatsAtomic {
             if l.seeder {
                 atomic_inc(&self.live_seeders);
             }
+            // A connection is created interested (see `LivePeerState::new`), so
+            // interest must be maintained here as well as on the protocol
+            // edges — otherwise every new peer would be undercounted until it
+            // re-sent `Interested`.
+            if l.peer_interested {
+                atomic_inc(&self.interested_peers);
+            }
         }
         atomic_inc(self.counter(state));
     }
@@ -74,6 +81,9 @@ impl AggregatePeerStatsAtomic {
             atomic_dec(self.live_kind_counter(l));
             if l.seeder {
                 atomic_dec(&self.live_seeders);
+            }
+            if l.peer_interested {
+                atomic_dec(&self.interested_peers);
             }
         }
         atomic_dec(self.counter(state));

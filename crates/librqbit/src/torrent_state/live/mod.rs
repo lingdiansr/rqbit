@@ -2296,22 +2296,11 @@ impl PeerHandler {
             }
         };
 
-        // Peer chunk/byte counters.
-        let before = self
-            .counters
-            .fetched_bytes
-            .fetch_add(piece.len() as u64, Ordering::Relaxed);
+        // Peer chunk/byte counters; the aggregate tracks the crossing.
+        self.state
+            .peers
+            .note_peer_fetched_bytes(&self.counters, piece.len() as u64);
         self.counters.fetched_chunks.fetch_add(1, Ordering::Relaxed);
-        // `before` is the pre-add value, so the aggregate counts each peer once,
-        // at the moment it first crosses the usefulness threshold.
-        if before < peer::stats::atomic::USEFUL_PEER_BYTES
-            && before + piece.len() as u64 >= peer::stats::atomic::USEFUL_PEER_BYTES
-        {
-            self.state
-                .stats
-                .useful_peers
-                .fetch_add(1, Ordering::Relaxed);
-        }
         // Turnover eligibility: this peer just sent us payload.
         self.state
             .peers
