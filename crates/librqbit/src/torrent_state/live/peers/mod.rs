@@ -520,6 +520,61 @@ mod tests {
         }
     }
 
+    /// The plan asks for the pool to stay bounded when far more distinct
+    /// candidates arrive than it can hold, with a live connection never
+    /// disturbed and a fresh reachable peer still admitted afterwards.
+    #[test]
+    fn candidate_pool_stays_bounded_under_a_large_candidate_stream() {
+        const INJECTED: usize = 30_000;
+        let peers = make_peer_states();
+        let (live, _live_rx) = add_live_peer(&peers, "127.0.0.1:40000");
+        let live_before = peers.stats().live;
+
+        for i in 0..INJECTED {
+            let addr: SocketAddr = format!("10.{}.{}.{}:6881", i / 65536, (i / 256) % 256, i % 256)
+                .parse()
+                .expect("candidate addr");
+            // Admitted or rejected; either way the pool must not grow past the cap.
+            peers.add_if_not_seen(addr);
+            assert!(
+                peers.states.len() <= MAX_CANDIDATE_PEERS,
+                "pool grew to {} after {i} candidates",
+                peers.states.len()
+            );
+        }
+
+        // Every injected candidate was Queued, i.e. evictable, so the pool
+        // absorbed the whole stream by evicting the oldest — nothing had to be
+        // rejected outright. (Rejection when nothing is evictable is covered by
+        // `candidate_pool_is_bounded_and_rejects_when_nothing_is_evictable`.)
+        assert_eq!(
+            peers.stats().candidate_rejected,
+            0,
+            "an evictable pool must not report rejected candidates"
+        );
+        // The stream was far larger than the pool, so the retained set must be
+        // the newest arrivals, not the first ones seen.
+        let first: SocketAddr = "10.0.0.0:6881".parse().unwrap();
+        assert!(
+            peers.states.get(&first).is_none(),
+            "the oldest candidate must have been evicted long before the stream ended"
+        );
+        // The established connection was never sacrificed for a candidate.
+        assert_eq!(
+            peers.stats().live,
+            live_before,
+            "turnover must not evict a live peer to make room for candidates"
+        );
+        // A newly reachable peer still gets in (someone was evictable).
+        let newcomer: SocketAddr = "127.0.0.1:45000".parse().unwrap();
+        assert!(
+            peers.add_if_not_seen(newcomer).is_some(),
+            "a new candidate must still be admitted while evictable entries exist"
+        );
+        // And the live peer is still there.
+        assert!(peers.states.get(&live).is_some());
+    }
+
     #[test]
     fn candidate_pool_is_bounded_and_rejects_when_nothing_is_evictable() {
         let peers = make_peer_states();

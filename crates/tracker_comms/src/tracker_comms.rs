@@ -533,6 +533,120 @@ mod tests {
     use super::*;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
+    /// A minimal HTTP tracker: answers any GET with a compact bencoded response
+    /// and records how many announces are being handled at once, so the test can
+    /// assert the *session-wide* peak rather than only the semaphore's value.
+    fn spawn_counting_tracker(
+        peak: Arc<AtomicUsize>,
+        in_flight: Arc<AtomicUsize>,
+        served: Arc<AtomicUsize>,
+    ) -> u16 {
+        use std::io::{Read, Write};
+
+        let listener = std::net::TcpListener::bind(("127.0.0.1", 0)).expect("bind tracker");
+        let port = listener.local_addr().expect("addr").port();
+        listener.set_nonblocking(false).expect("blocking listener");
+
+        std::thread::spawn(move || {
+            for stream in listener.incoming() {
+                let Ok(mut stream) = stream else { continue };
+                // Read the request head so the client sees a well-formed reply.
+                let mut buf = [0u8; 1024];
+                let _ = stream.read(&mut buf);
+
+                let now = in_flight.fetch_add(1, Ordering::SeqCst) + 1;
+                peak.fetch_max(now, Ordering::SeqCst);
+                // Hold the request open briefly: overlapping announces become
+                // observable instead of racing past each other.
+                std::thread::sleep(std::time::Duration::from_millis(50));
+                in_flight.fetch_sub(1, Ordering::SeqCst);
+                served.fetch_add(1, Ordering::SeqCst);
+
+                // A valid bencoded response: no peers, 60s interval.
+                let body = b"d8:peers0:8:intervali60e13:min intervali30ee".to_vec();
+                let head = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                    body.len()
+                );
+                let _ = stream.write_all(head.as_bytes());
+                let _ = stream.write_all(&body);
+                let _ = stream.flush();
+            }
+        });
+        port
+    }
+
+    /// Plan verification: with 20 real HTTP trackers and the default budget of
+    /// 8, every tracker receives its announce and the server-observed
+    /// concurrency never exceeds the budget.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn real_http_trackers_observe_the_announce_budget_peak() {
+        const TRACKERS: usize = 20;
+        const BUDGET: usize = 8;
+
+        let peak = Arc::new(AtomicUsize::new(0));
+        let in_flight = Arc::new(AtomicUsize::new(0));
+        let served = Arc::new(AtomicUsize::new(0));
+
+        let mut urls = HashSet::new();
+        for _ in 0..TRACKERS {
+            let port = spawn_counting_tracker(peak.clone(), in_flight.clone(), served.clone());
+            urls.insert(
+                Url::parse(&format!("http://127.0.0.1:{port}/announce")).expect("tracker url"),
+            );
+        }
+
+        let budget = Arc::new(tokio::sync::Semaphore::new(BUDGET));
+        let cancel = tokio_util::sync::CancellationToken::new();
+        let client = reqwest::Client::new();
+        let udp = UdpTrackerClient::new(cancel.clone(), None)
+            .await
+            .expect("udp client");
+
+        let mut stream = TrackerComms::start(
+            Id20::default(),
+            Id20::default(),
+            urls,
+            Box::new(()),
+            None,
+            6881,
+            client,
+            udp,
+            budget,
+            cancel.clone(),
+        )
+        .expect("tracker comms start");
+
+        // The returned stream is lazy: the monitors only run while it is being
+        // polled, so drain it for the duration of the measurement.
+        let drain = tokio::spawn(async move {
+            use futures::StreamExt;
+            while stream.next().await.is_some() {}
+        });
+
+        // Let the monitors run their first announce round.
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(15);
+        while served.load(Ordering::SeqCst) < TRACKERS {
+            if tokio::time::Instant::now() > deadline {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        cancel.cancel();
+        let _ = tokio::time::timeout(Duration::from_secs(5), drain).await;
+
+        let served = served.load(Ordering::SeqCst);
+        let peak = peak.load(Ordering::SeqCst);
+        assert_eq!(
+            served, TRACKERS,
+            "every tracker, including those past the budget, must receive an announce"
+        );
+        assert!(
+            peak <= BUDGET,
+            "observed announce concurrency {peak} exceeded the budget {BUDGET}"
+        );
+    }
+
     /// Every tracker must eventually get its announce served, including the
     /// 9th and later: the monitors all run, and only the network request is
     /// serialised by the budget.
