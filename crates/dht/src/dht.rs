@@ -1568,6 +1568,87 @@ mod tests {
         );
     }
 
+    /// A minimal DHT node: answers `find_node`/`ping` with a well-formed
+    /// response carrying no nodes, which is all a bootstrap needs to succeed.
+    fn spawn_answering_dht_node() -> SocketAddr {
+        let server = std::net::UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).expect("bind node");
+        let addr = server.local_addr().expect("node addr");
+        std::thread::spawn(move || {
+            use std::sync::atomic::{AtomicU16, Ordering as AtomicOrdering};
+            let seen = AtomicU16::new(0);
+            let mut buf = [0u8; 2048];
+            loop {
+                let Ok((len, from)) = server.recv_from(&mut buf) else {
+                    continue;
+                };
+                let Ok(msg) = bprotocol::deserialize_message::<ByteBufOwned>(&buf[..len]) else {
+                    continue;
+                };
+                // Any query (find_node, ping, get_peers) gets the same reply.
+                if matches!(msg.kind, MessageKind::Response(_) | MessageKind::Error(_)) {
+                    continue;
+                }
+                let id = librqbit_core::hash_id::Id20::default();
+                let tid = seen.fetch_add(1, AtomicOrdering::Relaxed).to_be_bytes();
+                // `d1:rd2:id20:<id>5:nodes0:e1:t2:<tid>1:y1:re` with a 20-byte id.
+                let mut resp = Vec::new();
+                resp.extend_from_slice(b"d1:rd2:id20:");
+                resp.extend_from_slice(&id.0);
+                resp.extend_from_slice(b"5:nodes0:e1:t2:");
+                resp.extend_from_slice(&[tid[0], tid[1]]);
+                resp.extend_from_slice(b"1:y1:re");
+                let _ = server.send_to(&resp, from);
+            }
+        });
+        addr
+    }
+
+    /// Plan verification: one reachable address family is enough for the
+    /// bootstrap to succeed, even when the other family fails for the same host.
+    #[tokio::test]
+    async fn bootstrap_succeeds_when_one_address_family_works() {
+        let node = spawn_answering_dht_node();
+
+        // "localhost" resolves to both ::1 and 127.0.0.1 on typical hosts; only
+        // the IPv4 port has a listener, so v6 fails while v4 succeeds.
+        let listener_port = node.port();
+        let config = DhtConfig {
+            listen_addr: Some((Ipv4Addr::LOCALHOST, 0).into()),
+            bootstrap_addrs: Some(vec![format!("localhost:{listener_port}")]),
+            ..Default::default()
+        };
+        let state = DhtState::with_config(config).await.expect("dht state");
+
+        let mut success = 0;
+        for _ in 0..50 {
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            let stats = state.stats();
+            success = stats.bootstrap_successes;
+            // The v4 side answered, so the whole bootstrap is a success even if
+            // v6 kept failing.
+            if success > 0 {
+                break;
+            }
+        }
+        assert!(
+            success > 0,
+            "a reachable IPv4 bootstrap node must count as a successful bootstrap"
+        );
+        // DNS itself never failed, so the DNS counter must stay untouched.
+        assert_eq!(
+            state.stats().bootstrap_dns_failures,
+            0,
+            "a resolvable host must not be attributed to DNS failure"
+        );
+        // `localhost` resolves to both families and only IPv4 has a listener, so
+        // the v6 side must be recorded as the family that failed — otherwise
+        // this test would also pass with both families succeeding.
+        assert!(
+            state.stats().bootstrap_v6_failures > 0,
+            "the IPv6 side had no listener, so it must be counted as a family failure"
+        );
+    }
+
     // On Windows, a datagram longer than the receive buffer makes recv_from fail with
     // WSAEMSGSIZE (os error 10040).
     #[tokio::test]
