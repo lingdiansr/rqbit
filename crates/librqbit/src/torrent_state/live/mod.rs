@@ -230,6 +230,9 @@ pub struct TorrentStateLive {
     pub(crate) streams: Arc<TorrentStreams>,
     have_broadcast_tx: tokio::sync::broadcast::Sender<ValidPieceIndex>,
 
+    /// Monotonic id of this live instance, so upload accounting can tell a
+    /// counter reset (new instance) from "no new uploads" (same instance).
+    live_epoch: u64,
     /// Bounded, per-peer-fair upload request queue (replaces the upstream
     /// torrent-level unbounded FIFO).
     upload_queue: std::sync::Mutex<upload_queue::UploadQueue>,
@@ -353,6 +356,12 @@ impl TorrentStateLive {
         }
         rotated
     }
+}
+
+/// Process-wide monotonic source of `live_epoch` values.
+fn next_live_epoch() -> u64 {
+    static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+    NEXT.fetch_add(1, Ordering::Relaxed)
 }
 
 impl DialSource for TorrentStateLive {
@@ -512,6 +521,7 @@ impl TorrentStateLive {
             per_piece_locks: (0..lengths.total_pieces())
                 .map(|_| RwLock::new(()))
                 .collect(),
+            live_epoch: next_live_epoch(),
             upload_queue: std::sync::Mutex::new(upload_queue::UploadQueue::new()),
             upload_notify: Notify::new(),
             peer_generations: std::sync::Mutex::new(std::collections::HashMap::new()),
@@ -998,6 +1008,7 @@ impl TorrentStateLive {
             downloaded_and_checked_pieces: self.stats.downloaded_and_checked_pieces.load(Relaxed),
             fetched_bytes: self.stats.fetched_bytes.load(Relaxed),
             uploaded_bytes: self.stats.uploaded_bytes.load(Relaxed),
+            live_epoch: self.live_epoch,
             total_piece_download_ms: self.stats.total_piece_download_ms.load(Relaxed),
             peer_stats: self.peers.stats(),
         }

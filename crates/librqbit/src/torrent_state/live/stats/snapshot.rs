@@ -11,6 +11,13 @@ pub struct StatsSnapshot {
     pub fetched_bytes: u64,
     pub uploaded_bytes: u64,
 
+    /// Process-wide monotonic id of the live state this snapshot came from.
+    /// `uploaded_bytes` counts only within one epoch: it resets to zero when
+    /// the torrent is paused and resumed.  Consumers that accumulate uploads
+    /// across pause/resume must key their baseline on this id, otherwise a
+    /// counter reset is indistinguishable from "no new uploads".
+    pub live_epoch: u64,
+
     pub downloaded_and_checked_pieces: u64,
     pub total_piece_download_ms: u64,
     pub peer_stats: AggregatePeerStats,
