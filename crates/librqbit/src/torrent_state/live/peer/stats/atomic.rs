@@ -27,7 +27,14 @@ pub(crate) struct PeerCountersAtomic {
     /// decide whether to disconnect the peer (aligned with transmission
     /// `MaxBadPiecesPerPeer`).
     pub bad_pieces: AtomicU32,
+#[derive(Clone, Copy, Debug)]
+pub enum FailureClass {
+    NetworkTimeout,    // 连接超时/read timeout
+    NetworkRefused,    // 连接拒绝/重置
+    HandshakeMismatch, // wrong info-hash 等协议不匹配
+    BadContent,        // 校验失败（复用 #9 的 bad_pieces）
 }
+
 
 impl PeerCountersAtomic {
     pub(crate) fn on_piece_completed(&self, piece_len: u64, elapsed: Duration) {

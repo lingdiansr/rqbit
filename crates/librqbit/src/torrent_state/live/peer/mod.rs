@@ -276,7 +276,8 @@ pub(crate) struct LivePeerState {
     // The main channel to send requests to peer.
     pub tx: PeerTx,
 
-    pub connection_kind: ConnectionKind,
+    pub public_last_failure_class: Option<FailureClass>,
+    pub connect_attempts: u32,
 }
 
 impl LivePeerState {

@@ -594,7 +594,21 @@ impl TorrentStateLive {
             }
             Err(e) => {
                 debug!("error managing peer: {:#}", e);
-                handler.on_peer_died(Some(e))?;
+                // Classify the failure and update peer state
+                let failure_class = match e {
+                    Error::ConnectTimeout => FailureClass::NetworkTimeout,
+                    Error::ConnectRefused => FailureClass::NetworkRefused,
+                    Error::HandshakeMismatch => FailureClass::HandshakeMismatch,
+                    _ => FailureClass::BadContent,
+                };
+                
+                // Update peer state with failure classification
+                if let Some(mut peer) = state.peers.with_live_mut(addr, "error classification", |p| p) {
+                    peer.public_last_failure_class = Some(failure_class);
+                    peer.connect_attempts += 1;
+                }
+                
+                handler.on_peer_died(Some(e))?
             }
         }
         drop(permit);
@@ -1079,19 +1093,25 @@ struct PeerHandler {
     cancel_token: CancellationToken,
 
     client_name_and_version: String,
+    }
 }
-
 impl PeerConnectionHandler for &'_ PeerHandler {
     fn on_connected(&self, connection_time: Duration) {
         self.counters
             .outgoing_connections
             .fetch_add(1, Ordering::Relaxed);
         #[allow(clippy::cast_possible_truncation)]
+        let elapsed = connection_time.as_millis() as u64;
         self.counters
             .total_time_connecting_ms
-            .fetch_add(connection_time.as_millis() as u64, Ordering::Relaxed);
+            .fetch_add(elapsed, Ordering::Release);
+        
+        // Reset connection attempts on successful connection
+        if let Some(mut peer) = self.state.peers.with_live_mut(self.addr, "connection success", |p| p) {
+            peer.connect_attempts = 0;
+            peer.public_last_failure_class = None;
+        }
     }
-
     async fn on_received_message(&self, message: Message<'_>) -> anyhow::Result<()> {
         // The first message must be "bitfield", but if it's not sent,
         // assume the bitfield is all zeroes and was sent.

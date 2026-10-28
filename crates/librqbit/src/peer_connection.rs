@@ -156,8 +156,25 @@ async fn connect_with_mse_fallback(
     use crate::mse::OutgoingOutcome;
     use crate::vectored_traits::AsyncReadVectoredIntoCompat;
 
-    let (ckind, read, write) =
-        with_timeout("connecting", connect_timeout, connector.connect(addr)).await?;
+    let mut connect_attempts = 0;
+    let mut last_error = None;
+    loop {
+        let result = with_timeout("connecting", connect_timeout, connector.connect(addr)).await;
+        match result {
+            Ok(ckind_read_write) => {
+                break Ok(ckind_read_write);
+            }
+            Err(e) => {
+                connect_attempts += 1;
+                last_error = Some(e);
+                if connect_attempts >= 2 {
+                    break Err(Error::ConnectTimeout);
+                }
+                // Wait a bit before retrying
+                tokio::time::sleep(Duration::from_millis(100)).await;
+            }
+        }
+    }
 
     if mse_mode == MseMode::Disabled || !matches!(ckind, ConnectionKind::Tcp) {
         debug!(
@@ -355,7 +372,11 @@ impl<H: PeerConnectionHandler> PeerConnection<H> {
             })?,
             self.options.mse_mode,
         )
-        .await?;
+        .await
+        .map_err(|e| match e {
+            Error::ConnectTimeout => e,
+            _ => Error::Anyhow(anyhow::anyhow!("connection failed: {:#}", e)),
+        })?;
 
         async move {
             self.handler.on_connected(now.elapsed());

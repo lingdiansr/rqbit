@@ -23,7 +23,8 @@ pub enum Error {
         tcp: librqbit_dualstack_sockets::Error,
         utp: librqbit_utp::Error,
     },
-    #[error("uTP disabled")]
+    #[error("connect timeout")]
+    ConnectTimeout,
     UtpDisabled,
     #[error("TCP connections disabled")]
     TcpDisabled,
